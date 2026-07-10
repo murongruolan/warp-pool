@@ -83,7 +83,9 @@ func Build(cfg config.Config, opts Options) (Config, error) {
 			{Type: "direct", Tag: "direct"},
 			{Type: "block", Tag: "block"},
 		},
-		Route: Route{AutoDetectInterface: true},
+		// Let the kernel routing table choose the path. This is important when
+		// IPv6 reachability is provided by a separate tunnel on the main server.
+		Route: Route{},
 	}
 
 	for _, node := range cfg.Nodes {

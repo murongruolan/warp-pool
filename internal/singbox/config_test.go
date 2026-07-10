@@ -39,6 +39,9 @@ func TestBuildConfig(t *testing.T) {
 	if !strings.HasPrefix(sb.Route.Rules[0].Inbound[0], "in-nat1-") || sb.Route.Rules[0].Outbound != endpoint.Tag {
 		t.Fatalf("unexpected route rule: %#v", sb.Route.Rules[0])
 	}
+	if sb.Route.AutoDetectInterface {
+		t.Fatal("auto_detect_interface should stay disabled so kernel policy routing can be used")
+	}
 }
 
 func TestBuildMapsSocks5Inbound(t *testing.T) {
