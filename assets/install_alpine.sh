@@ -343,6 +343,10 @@ start_remote_wireguard() {
   fi
   run wg-quick down "$WG_DEVICE" >/dev/null 2>&1 || true
   run wg-quick up "$WG_DEVICE"
+  if command -v rc-update >/dev/null 2>&1 && [ -e /etc/init.d/wg-quick ]; then
+    run ln -sf /etc/init.d/wg-quick "/etc/init.d/wg-quick.$WG_DEVICE"
+    run rc-update add "wg-quick.$WG_DEVICE" default >/dev/null 2>&1 || true
+  fi
 }
 
 enable_direct_forwarding() {

@@ -181,6 +181,18 @@ EOF_RULES
 
   while IFS= read -r rule; do
     case "$rule" in
+      *" -i $device "*"-j TCPMSS "*)
+        spec="${rule#-A PREROUTING }"
+        # shellcheck disable=SC2086
+        iptables -t mangle -D PREROUTING $spec >/dev/null 2>&1 || true
+        ;;
+    esac
+  done <<EOF_RULES
+$(iptables -t mangle -S PREROUTING 2>/dev/null || true)
+EOF_RULES
+
+  while IFS= read -r rule; do
+    case "$rule" in
       *" -i $device "*"-j ACCEPT"*)
         spec="${rule#-A INPUT }"
         # shellcheck disable=SC2086
@@ -333,6 +345,13 @@ remove_warp_forwarding() {
 remove_wireguard_device() {
   local device="$1"
   disable_systemd_unit "wg-quick@$device.service"
+  if openrc_available; then
+    run rc-service "wg-quick.$device" stop >/dev/null 2>&1 || true
+    run rc-update del "wg-quick.$device" default >/dev/null 2>&1 || true
+    if [ -L "/etc/init.d/wg-quick.$device" ]; then
+      run rm -f "/etc/init.d/wg-quick.$device"
+    fi
+  fi
   run wg-quick down "$device" >/dev/null 2>&1 || true
   if command -v ip >/dev/null 2>&1 && ip link show "$device" >/dev/null 2>&1; then
     run ip link delete dev "$device" >/dev/null 2>&1 || true

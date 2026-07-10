@@ -6,6 +6,7 @@ DEVICE=""
 CLIENT_ADDR=""
 SERVER_ADDR=""
 TRANSPARENT_PORT="14000"
+WARP_TCP_MSS="${WARPPOOL_WARP_TCP_MSS:-1000}"
 WARP_PROXY_HOST="127.0.0.1"
 WARP_PROXY_PORT="40000"
 WARP_BACKEND="auto"
@@ -44,7 +45,7 @@ usage() {
 WarpPool WARP forwarding helper
 
 Usage:
-  bash warp_forward.sh action=up|down|status|probe device=<wg-device> client_addr=<client-cidr> [server_addr=<server-cidr>] [transparent_port=14000] [backend=auto|socks|wireguard] [--dry-run]
+  bash warp_forward.sh action=up|down|status|probe device=<wg-device> client_addr=<client-cidr> [server_addr=<server-cidr>] [transparent_port=14000] [tcp_mss=1000] [backend=auto|socks|wireguard] [--dry-run]
 
 This script redirects TCP traffic entering the WireGuard device to a local
 sing-box redirect inbound, then sends it to Cloudflare WARP. The default
@@ -68,6 +69,7 @@ parse_args() {
       client_addr=*) CLIENT_ADDR="${arg#client_addr=}" ;;
       server_addr=*) SERVER_ADDR="${arg#server_addr=}" ;;
       transparent_port=*) TRANSPARENT_PORT="${arg#transparent_port=}" ;;
+      tcp_mss=*|mss=*) WARP_TCP_MSS="${arg#*=}" ;;
       warp_proxy_host=*) WARP_PROXY_HOST="${arg#warp_proxy_host=}" ;;
       warp_proxy_port=*) WARP_PROXY_PORT="${arg#warp_proxy_port=}" ;;
       backend=*) WARP_BACKEND="${arg#backend=}" ;;
@@ -158,6 +160,15 @@ validate_args() {
     fail "transparent_port must be between 1 and 65535: $TRANSPARENT_PORT"
   fi
 
+  case "$WARP_TCP_MSS" in
+    *[!0-9]*|"")
+      fail "invalid tcp_mss: $WARP_TCP_MSS"
+      ;;
+  esac
+  if [ "$WARP_TCP_MSS" -lt 536 ] || [ "$WARP_TCP_MSS" -gt 1460 ]; then
+    fail "tcp_mss must be between 536 and 1460: $WARP_TCP_MSS"
+  fi
+
   case "$WARP_PROXY_PORT" in
     *[!0-9]*|"")
       fail "invalid warp_proxy_port: $WARP_PROXY_PORT"
@@ -225,6 +236,14 @@ client_rule_loop_add() {
 
 client_rule_loop_delete_all() {
   printf 'if [ -r %s ]; then while read ip; do [ -n "$ip" ] || continue; while iptables -t nat -C PREROUTING -i %s -s "$ip/32" -p tcp -j REDIRECT --to-ports %s >/dev/null 2>&1; do iptables -t nat -D PREROUTING -i %s -s "$ip/32" -p tcp -j REDIRECT --to-ports %s; done; done < %s; fi' "$CLIENTS_PATH" "$DEVICE" "$TRANSPARENT_PORT" "$DEVICE" "$TRANSPARENT_PORT" "$CLIENTS_PATH"
+}
+
+client_mss_rule_loop_add() {
+  printf 'if [ -r %s ]; then while read ip; do [ -n "$ip" ] || continue; iptables -t mangle -C PREROUTING -i %s -s "$ip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s 2>/dev/null || iptables -t mangle -A PREROUTING -i %s -s "$ip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s; done < %s; fi' "$CLIENTS_PATH" "$DEVICE" "$WARP_TCP_MSS" "$DEVICE" "$WARP_TCP_MSS" "$CLIENTS_PATH"
+}
+
+client_mss_rule_loop_delete_all() {
+  printf 'if [ -r %s ]; then while read ip; do [ -n "$ip" ] || continue; while iptables -t mangle -C PREROUTING -i %s -s "$ip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s >/dev/null 2>&1; do iptables -t mangle -D PREROUTING -i %s -s "$ip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss %s; done; done < %s; fi' "$CLIENTS_PATH" "$DEVICE" "$WARP_TCP_MSS" "$DEVICE" "$WARP_TCP_MSS" "$CLIENTS_PATH"
 }
 
 script_dir() {
@@ -866,9 +885,11 @@ clients_remaining() {
 }
 
 start_singbox() {
-  local exec_start command_path command_args add_client_rules delete_client_rules
+  local exec_start command_path command_args add_client_rules delete_client_rules add_mss_rules delete_mss_rules
   add_client_rules="$(client_rule_loop_add)"
   delete_client_rules="$(client_rule_loop_delete_all)"
+  add_mss_rules="$(client_mss_rule_loop_add)"
+  delete_mss_rules="$(client_mss_rule_loop_delete_all)"
   if systemd_available; then
     if [ "$DRY_RUN" = "true" ]; then
       log "dry-run: write systemd unit: $UNIT_PATH"
@@ -880,15 +901,16 @@ start_singbox() {
     cat >"$UNIT_PATH" <<EOF
 [Unit]
 Description=WarpPool WARP forward for $DEVICE
-After=network-online.target
-Wants=network-online.target
+After=network-online.target wg-quick@$DEVICE.service
+Wants=network-online.target wg-quick@$DEVICE.service
 
 [Service]
 Type=simple
 ExecStartPre=/bin/sh -c 'iptables -C INPUT -i $DEVICE -p tcp -j ACCEPT 2>/dev/null || iptables -A INPUT -i $DEVICE -p tcp -j ACCEPT'
 ExecStartPre=/bin/sh -c '$add_client_rules'
+ExecStartPre=/bin/sh -c '$add_mss_rules'
 ExecStart=$exec_start
-ExecStopPost=/bin/sh -c '$delete_client_rules; while iptables -C INPUT -i $DEVICE -p tcp -j ACCEPT >/dev/null 2>&1; do iptables -D INPUT -i $DEVICE -p tcp -j ACCEPT; done'
+ExecStopPost=/bin/sh -c '$delete_mss_rules; $delete_client_rules; while iptables -C INPUT -i $DEVICE -p tcp -j ACCEPT >/dev/null 2>&1; do iptables -D INPUT -i $DEVICE -p tcp -j ACCEPT; done'
 Restart=on-failure
 RestartSec=3
 
@@ -925,16 +947,18 @@ output_log="$LOG_PATH"
 error_log="$LOG_PATH"
 
 depend() {
-  need net
+  need net wg-quick.$DEVICE
   after firewall
 }
 
 start_pre() {
   iptables -C INPUT -i $DEVICE -p tcp -j ACCEPT 2>/dev/null || iptables -A INPUT -i $DEVICE -p tcp -j ACCEPT
   $add_client_rules
+  $add_mss_rules
 }
 
 stop_post() {
+  $delete_mss_rules
   $delete_client_rules
   while iptables -C INPUT -i $DEVICE -p tcp -j ACCEPT >/dev/null 2>&1; do
     iptables -D INPUT -i $DEVICE -p tcp -j ACCEPT
@@ -1007,14 +1031,19 @@ add_iptables_rules() {
     while IFS= read -r ip; do
       [ -n "$ip" ] || continue
       run iptables -t nat -C PREROUTING -i "$DEVICE" -s "$ip/32" -p tcp -j REDIRECT --to-ports "$TRANSPARENT_PORT" 2>/dev/null || run iptables -t nat -A PREROUTING -i "$DEVICE" -s "$ip/32" -p tcp -j REDIRECT --to-ports "$TRANSPARENT_PORT"
+      run iptables -t mangle -C PREROUTING -i "$DEVICE" -s "$ip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_TCP_MSS" 2>/dev/null || run iptables -t mangle -A PREROUTING -i "$DEVICE" -s "$ip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_TCP_MSS"
     done <"$CLIENTS_PATH"
     return 0
   fi
   run iptables -t nat -C PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp -j REDIRECT --to-ports "$TRANSPARENT_PORT" 2>/dev/null || run iptables -t nat -A PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp -j REDIRECT --to-ports "$TRANSPARENT_PORT"
+  run iptables -t mangle -C PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_TCP_MSS" 2>/dev/null || run iptables -t mangle -A PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_TCP_MSS"
 }
 
 delete_iptables_rules() {
   require_command iptables
+  while iptables -t mangle -C PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_TCP_MSS" >/dev/null 2>&1; do
+    run iptables -t mangle -D PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_TCP_MSS"
+  done
   while iptables -t nat -C PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp -j REDIRECT --to-ports "$TRANSPARENT_PORT" >/dev/null 2>&1; do
     run iptables -t nat -D PREROUTING -i "$DEVICE" -s "$CLIENT_IP/32" -p tcp -j REDIRECT --to-ports "$TRANSPARENT_PORT"
   done
@@ -1031,6 +1060,7 @@ status() {
     cat "$PID_PATH"
   fi
   iptables -t nat -S PREROUTING 2>/dev/null | grep -- "$DEVICE" || true
+  iptables -t mangle -S PREROUTING 2>/dev/null | grep -- "$DEVICE" || true
 }
 
 main() {

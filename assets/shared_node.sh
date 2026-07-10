@@ -508,6 +508,17 @@ ensure_interface_addresses() {
   fi
 }
 
+enable_wireguard_boot() {
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl enable "wg-quick@$DEVICE" >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v rc-update >/dev/null 2>&1 && [ -e /etc/init.d/wg-quick ]; then
+    run ln -sf /etc/init.d/wg-quick "/etc/init.d/wg-quick.$DEVICE"
+    run rc-update add "wg-quick.$DEVICE" default >/dev/null 2>&1 || true
+  fi
+}
+
 apply_config() {
   if [ "$SKIP_UP" = "true" ]; then
     log "skip WireGuard startup requested"
@@ -532,9 +543,7 @@ apply_config() {
     log "starting shared WireGuard interface: $DEVICE"
     run wg-quick up "$DEVICE"
   fi
-  if command -v systemctl >/dev/null 2>&1; then
-    run systemctl enable "wg-quick@$DEVICE" >/dev/null 2>&1 || true
-  fi
+  enable_wireguard_boot
 }
 
 print_response() {

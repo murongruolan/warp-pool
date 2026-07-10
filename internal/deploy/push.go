@@ -821,7 +821,7 @@ func configureRemoteWireGuard(runner RemoteRunner, plan wireguard.Plan, remoteDi
 	commands := []string{
 		"wg-quick down " + shellPath(plan.Device) + " >/dev/null 2>&1 || true",
 		"wg-quick up " + shellPath(plan.Device),
-		"systemctl enable " + shellPath("wg-quick@"+plan.Device) + " >/dev/null 2>&1 || true",
+		"if command -v systemctl >/dev/null 2>&1; then systemctl enable " + shellPath("wg-quick@"+plan.Device) + " >/dev/null 2>&1 || true; elif command -v rc-update >/dev/null 2>&1 && [ -e /etc/init.d/wg-quick ]; then ln -sf /etc/init.d/wg-quick " + shellPath("/etc/init.d/wg-quick."+plan.Device) + " && rc-update add " + shellPath("wg-quick."+plan.Device) + " default >/dev/null 2>&1 || true; fi",
 	}
 	for _, command := range commands {
 		remoteResult, err := runner.Run(command)
