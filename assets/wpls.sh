@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_VERSION="2026.10.11-r2"
+WPLS_VERSION="2026.10.11-r3"
 
 # wpls - WarpPool exit-node connection manager.
 #
@@ -477,6 +477,9 @@ cmd_add() {
 
 cmd_wgadd() {
   local dev name mode pub pub_ip pub_port endpoint cpriv wpub wpriv
+  # set -u: `local x` leaves x unset, not empty, so every conditional read below
+  # needs an explicit initial value.
+  pub=""; cpriv=""; wpub=""; wpriv=""; endpoint=""
   dev="$(detect_device)"
   info ""
   info "添加一台独立 WireGuard 设备：只要本节点的出口流量，不安装 wpl。"
