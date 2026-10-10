@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_UPDATE_VERSION="2026.10.11-r1"
+WPLS_UPDATE_VERSION="2026.10.11-r2"
 
 # Updates the exit-node tooling on an already installed node.
 #
@@ -22,10 +22,13 @@ HELPERS="warp_forward.sh warp_install.sh warp_wgcf.sh singbox_install.sh wg_pref
 ok_count=0
 bad_count=0
 
-log()  { printf '[wpls-update] %s\n' "$*"; }
-pass() { printf '  \033[32m✓\033[0m %s\n' "$*"; ok_count=$((ok_count + 1)); }
-bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; bad_count=$((bad_count + 1)); }
-hr()   { printf '%s\n' "------------------------------------------------------------"; }
+# Everything informational goes to stderr: resolve_url and download_and_extract
+# run inside command substitutions, so anything on stdout would be captured into
+# the URL or the assets path and break the download.
+log()  { printf '[wpls-update] %s\n' "$*" >&2; }
+pass() { printf '  \033[32m✓\033[0m %s\n' "$*" >&2; ok_count=$((ok_count + 1)); }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; bad_count=$((bad_count + 1)); }
+hr()   { printf '%s\n' "------------------------------------------------------------" >&2; }
 
 fail() { printf '[wpls-update][ERROR] %s\n' "$*" >&2; exit 1; }
 
@@ -158,9 +161,9 @@ verify() {
 
   hr
   if [ "$bad_count" -eq 0 ]; then
-    printf '\033[32m全部检查通过（%d 项）\033[0m\n' "$ok_count"
+    printf '\033[32m全部检查通过（%d 项）\033[0m\n' "$ok_count" >&2
   else
-    printf '\033[31m有 %d 项不通过\033[0m（通过 %d 项）\n' "$bad_count" "$ok_count"
+    printf '\033[31m有 %d 项不通过\033[0m（通过 %d 项）\n' "$bad_count" "$ok_count" >&2
     return 1
   fi
   return 0
@@ -168,15 +171,15 @@ verify() {
 
 show_node_state() {
   hr
-  printf '现有节点状态（只读，未做任何改动）\n'
+  printf '现有节点状态（只读，未做任何改动）\n' >&2
   hr
   if [ -x "$BIN_DIR/wpls" ]; then
     "$BIN_DIR/wpls" list || true
   fi
-  printf '\n'
-  printf 'WireGuard 配置: %s\n' "$(ls /etc/wireguard/*.conf 2>/dev/null | tr '\n' ' ' || echo '(无)')"
+  printf '\n' >&2
+  printf 'WireGuard 配置: %s\n' "$(ls /etc/wireguard/*.conf 2>/dev/null | tr '\n' ' ' || echo '(无)')" >&2
   if command -v wg >/dev/null 2>&1; then
-    printf '运行中接口  : %s\n' "$(wg show interfaces 2>/dev/null | tr '\n' ' ' || echo '(无)')"
+    printf '运行中接口  : %s\n' "$(wg show interfaces 2>/dev/null | tr '\n' ' ' || echo '(无)')" >&2
   fi
 }
 
@@ -214,7 +217,7 @@ main() {
   require_tools
 
   hr
-  printf '更新出口节点工具集（%s / %s）\n' "$REPO" "$BRANCH"
+  printf '更新出口节点工具集（%s / %s）\n' "$REPO" "$BRANCH" >&2
   hr
 
   local assets vrc=0
