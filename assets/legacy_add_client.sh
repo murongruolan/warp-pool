@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r4"
+SCRIPT_VERSION="2026.10.10-r5"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -442,6 +442,7 @@ add_client() {
       render_peer "$WARP_CLIENT_PUBLIC_KEY" "$warp_ip"
     fi
   } >"$tmp"
+  chmod 0600 "$tmp"
 
   log "new config rendered: $tmp"
   sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
@@ -479,8 +480,14 @@ add_client() {
   log "installed: $CONF"
 
   # 4. Hot apply. The interface stays up; existing peers keep their sessions.
+  #    If the apply fails for any reason, put the previous config straight back
+  #    so the node never keeps a broken file on disk.
   require_command wg
-  wg syncconf "$DEVICE" <(wg-quick strip "$CONF")
+  if ! wg syncconf "$DEVICE" <(wg-quick strip "$CONF"); then
+    log "syncconf FAILED - restoring $CONF from $backup"
+    cp -a "$backup" "$CONF"
+    fail "hot apply failed; the previous config has been restored, nothing was lost"
+  fi
   log "hot applied with wg syncconf"
 
   # 5. NAT rules for the new direct client (PostUp only runs on interface start).
@@ -673,7 +680,11 @@ remove_client() {
 
   cp -a "$CONF" "$backup"
   install -m 0600 "$tmp" "$CONF"
-  wg syncconf "$DEVICE" <(wg-quick strip "$CONF")
+  if ! wg syncconf "$DEVICE" <(wg-quick strip "$CONF"); then
+    log "syncconf FAILED - restoring $CONF from $backup"
+    cp -a "$backup" "$CONF"
+    fail "removal hot apply failed; the previous config has been restored"
+  fi
   log "hot applied removal"
 
   if [ -n "$dip" ] && [ -r "$NAT_V4_FILE" ]; then
