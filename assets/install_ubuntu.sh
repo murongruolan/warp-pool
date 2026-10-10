@@ -236,6 +236,15 @@ install_wpls() {
     log "warning: exit node client helper not found: $helper"
   fi
 
+  local updater="$dir/wpls-update.sh"
+  if [ -r "$updater" ]; then
+    run cp "$updater" /usr/local/bin/wpls-update
+    run chmod 0755 /usr/local/bin/wpls-update
+    log "installed exit node updater: /usr/local/bin/wpls-update"
+  else
+    log "warning: exit node updater not found: $updater"
+  fi
+
   # Helpers the connection manager invokes at runtime. Keeping them on disk means
   # it never has to fetch them from the release URL, which is how a node
   # installed from an older release ended up running a helper that did not
