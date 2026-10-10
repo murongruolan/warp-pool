@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_VERSION="2026.10.10-r4"
+
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
 # state directory, this edits the deployed config in place and applies it with
@@ -61,8 +63,9 @@ trap 'on_error $LINENO' ERR
 trap 'cleanup_download_dir' EXIT
 
 usage() {
-  cat <<'USAGE'
+  cat <<USAGE
 WarpPool legacy node client helper
+version ${SCRIPT_VERSION}
 
 Usage:
   bash legacy_add_client.sh
@@ -951,6 +954,7 @@ main() {
   local was_interactive="false"
   if [ "$#" -eq 0 ] || [ "$INTERACTIVE" = "true" ]; then
     was_interactive="true"
+    log "legacy_add_client.sh $SCRIPT_VERSION"
     interactive
   fi
   validate_args
