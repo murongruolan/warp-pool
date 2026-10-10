@@ -22,6 +22,7 @@
 - Fixed adding a client to a config that has no peers yet (`wpls init` produces exactly that) aborting under `set -o pipefail`.
 - Fixed `wpls init` not handing the interface to systemd, which made a later `systemctl restart` fail and, with the resilient drop-in, retry forever.
 - `wpls list` now uses ASCII type markers (`wpl` / `wg` / `-`); the Chinese label was 6 display columns but 9 bytes, shifting every column after it.
+- Fixed an atomicity gap when adding a WARP client: if WARP forwarding registration failed, the peer was already in the config while no registry record had been written yet, leaving the node inconsistent. A failed registration now restores the previous config and removes the NAT rule it had added, leaving nothing behind.
 
 ## v0.1.12
 

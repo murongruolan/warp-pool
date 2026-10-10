@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r21"
+SCRIPT_VERSION="2026.10.10-r22"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -619,9 +619,23 @@ add_client() {
     log "MASQUERADE rules reconciled for: $nat_list"
   fi
 
-  # 6. WARP forwarding for the new warp client.
+  # 6. WARP forwarding for the new warp client. This step can fail for reasons
+  #    outside our control (the WARP runtime is not connected yet). If it does,
+  #    roll the peer back: otherwise the config keeps a peer that has no registry
+  #    record, and the node ends up in the inconsistent state we hit before.
   if [ "$REGISTER_WARP" = "true" ] && [ -n "$warp_ip" ]; then
-    register_warp_client "$warp_ip"
+    if ! register_warp_client "$warp_ip"; then
+      log "WARP registration FAILED - rolling $CONF back from $backup"
+      cp -a "$backup" "$CONF"
+      wg syncconf "$DEVICE" <(wg-quick strip "$CONF") || true
+      if [ -n "$direct_ip" ]; then
+        while iptables -t nat -C POSTROUTING -s "$direct_ip/32" -o "$EGRESS" -j MASQUERADE >/dev/null 2>&1; do
+          iptables -t nat -D POSTROUTING -s "$direct_ip/32" -o "$EGRESS" -j MASQUERADE
+        done
+      fi
+      fail "WARP registration failed and the peer was rolled back; nothing was left behind.
+Check that Cloudflare WARP is connected on this node (warp-cli status / systemctl status warp-svc), then retry."
+    fi
   fi
 
   # 7. Client configs. Skipped when no endpoint was supplied: without one the

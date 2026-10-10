@@ -22,6 +22,7 @@
 - 修复配置中还没有任何 peer 时（`wpls init` 刚建好）添加客户端会因 `set -o pipefail` 中断。
 - 修复 `wpls init` 未把接口交给 systemd 管理，导致之后 `systemctl restart` 必然失败并因自愈策略无限重试。
 - `wpls list` 的类型列改用 ASCII 标记（`wpl` / `wg` / `-`），修正中文因字节数与显示宽度不一致造成的列错位。
+- 修复添加 WARP 客户端时的原子性缺口：WARP 转发注册（`warp_forward.sh action=register`）失败时，peer 已经写入配置，但登记记录尚未生成，节点会停在「有 peer、没记录」的不一致状态。现在注册失败会把配置回滚到改动前并清除已加的 NAT 规则，什么都不留下。
 
 ## v0.1.12
 
