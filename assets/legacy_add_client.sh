@@ -25,7 +25,6 @@ PRINT_CONFIG="true"
 DRY_RUN="false"
 INTERACTIVE="false"
 MODE_SET="false"
-KEY_SOURCE="1"
 MODE_CHOICE=""
 CLIENT_DIRECT_FILE=""
 CLIENT_WARP_FILE=""
@@ -724,21 +723,21 @@ interactive() {
 
   if [ "$MODE_SET" != "true" ]; then
     while true; do
-      prompt MODE_CHOICE "出口模式" "3"
+      prompt MODE_CHOICE "出口模式   1=direct 本机出口   2=warp WARP出口   3=dual 两者都要" "1"
       case "$MODE_CHOICE" in
-        1)
+        1|direct)
           MODE="direct"
-          log "出口模式: direct（本机出口）"
+          log "出口模式: direct（流量走本机出口 IP）"
           break
           ;;
-        2)
+        2|warp)
           MODE="warp"
-          log "出口模式: warp（WARP 出口）"
+          log "出口模式: warp（流量走 Cloudflare WARP 出口 IP）"
           break
           ;;
-        3)
+        3|dual)
           MODE="dual"
-          log "出口模式: dual（本机出口 + WARP 出口）"
+          log "出口模式: dual（本机出口 + WARP 出口 各一条隧道）"
           break
           ;;
         *) log "请输入 1、2 或 3" ;;
@@ -754,50 +753,41 @@ interactive() {
     fi
   fi
 
-  if [ -z "$CLIENT_PUBLIC_KEY" ]; then
-    prompt KEY_SOURCE "客户端密钥来源  1=我在电脑上生成好了，现在粘贴公钥  2=由本节点生成密钥对" "1"
-  fi
-
-  if [ "$KEY_SOURCE" = "2" ]; then
-    require_command wg
-    if [ -z "$CLIENT_PRIVATE_KEY" ]; then
-      CLIENT_PRIVATE_KEY="$(wg genkey)"
-    fi
+  while true; do
+    prompt CLIENT_PUBLIC_KEY "粘贴客户端公钥（WireGuard 生成，44 字符；直接回车则由本节点生成）" ""
     if [ -z "$CLIENT_PUBLIC_KEY" ]; then
+      require_command wg
+      CLIENT_PRIVATE_KEY="$(wg genkey)"
       CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
+      log "已在本节点生成密钥对，私钥会直接写进配置"
+      break
     fi
-    log "已在本节点生成密钥对"
-    if [ "$MODE" = "dual" ]; then
-      if [ -z "$WARP_CLIENT_PRIVATE_KEY" ]; then
-        WARP_CLIENT_PRIVATE_KEY="$(wg genkey)"
-      fi
-      if [ -z "$WARP_CLIENT_PUBLIC_KEY" ]; then
-        WARP_CLIENT_PUBLIC_KEY="$(printf '%s' "$WARP_CLIENT_PRIVATE_KEY" | wg pubkey)"
-      fi
-      log "已在本节点生成第二条（WARP）密钥对"
+    if is_public_key "$CLIENT_PUBLIC_KEY"; then
+      break
     fi
-  else
+    log "公钥格式不对，请重新输入，或直接回车让本节点生成"
+  done
+
+  if [ "$MODE" = "dual" ]; then
     while true; do
-      prompt CLIENT_PUBLIC_KEY "粘贴客户端公钥（WireGuard 生成，44 字符）" ""
-      if is_public_key "$CLIENT_PUBLIC_KEY"; then
+      prompt WARP_CLIENT_PUBLIC_KEY "粘贴第二条 WARP 隧道公钥（必须与上面不同；直接回车则由本节点生成）" ""
+      if [ -z "$WARP_CLIENT_PUBLIC_KEY" ]; then
+        require_command wg
+        WARP_CLIENT_PRIVATE_KEY="$(wg genkey)"
+        WARP_CLIENT_PUBLIC_KEY="$(printf '%s' "$WARP_CLIENT_PRIVATE_KEY" | wg pubkey)"
+        log "已在本节点生成 WARP 密钥对，私钥会直接写进配置"
         break
       fi
-      log "公钥格式不对，请重新输入"
+      if ! is_public_key "$WARP_CLIENT_PUBLIC_KEY"; then
+        log "公钥格式不对，请重新输入，或直接回车让本节点生成"
+        continue
+      fi
+      if [ "$WARP_CLIENT_PUBLIC_KEY" = "$CLIENT_PUBLIC_KEY" ]; then
+        log "两条隧道不能用同一个公钥（同一接口不允许重复 peer key），请换一个，或直接回车让本节点生成"
+        continue
+      fi
+      break
     done
-    if [ "$MODE" = "dual" ]; then
-      while true; do
-        prompt WARP_CLIENT_PUBLIC_KEY "粘贴第二条（WARP 隧道）公钥，必须和上面那条不同" ""
-        if is_public_key "$WARP_CLIENT_PUBLIC_KEY"; then
-          if [ "$WARP_CLIENT_PUBLIC_KEY" = "$CLIENT_PUBLIC_KEY" ]; then
-            log "两条隧道不能用同一个公钥，请重新输入"
-          else
-            break
-          fi
-        else
-          log "公钥格式不对，请重新输入"
-        fi
-      done
-    fi
   fi
 
   if [ -z "$ENDPOINT" ]; then
