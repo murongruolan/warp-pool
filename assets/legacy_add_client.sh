@@ -26,6 +26,7 @@ DRY_RUN="false"
 INTERACTIVE="false"
 MODE_SET="false"
 KEY_SOURCE="1"
+MODE_CHOICE=""
 CLIENT_DIRECT_FILE=""
 CLIENT_WARP_FILE=""
 ROLLBACK_BACKUP=""
@@ -157,8 +158,12 @@ validate_args() {
   if [ "$ACTION" = "add" ]; then
     [ -n "$NAME" ] || fail "name=<label> is required"
     [ -n "$CLIENT_PUBLIC_KEY" ] || fail "client_public_key is required"
-    if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
-      [ -n "$WARP_CLIENT_PUBLIC_KEY" ] || fail "warp_client_public_key is required in $MODE mode"
+    if [ "$MODE" = "dual" ]; then
+      [ -n "$WARP_CLIENT_PUBLIC_KEY" ] || fail "warp_client_public_key is required in dual mode"
+    fi
+    if [ "$MODE" = "direct" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+      log "mode=direct ignores warp_client_public_key"
+      WARP_CLIENT_PUBLIC_KEY=""
     fi
   fi
   if [ "$ACTION" = "remove" ]; then
@@ -466,14 +471,24 @@ add_client() {
   CLIENT_DIRECT_FILE=""
   CLIENT_WARP_FILE=""
   local direct_file warp_file
-  direct_file="$CONFIG_DIR/$NAME-direct.conf"
-  warp_file="$CONFIG_DIR/$NAME-warp.conf"
-  if [ -n "$direct_ip" ]; then
+  case "$MODE" in
+    dual)
+      direct_file="$CONFIG_DIR/$NAME-direct.conf"
+      warp_file="$CONFIG_DIR/$NAME-warp.conf"
+      ;;
+    warp)
+      warp_file="$CONFIG_DIR/$NAME.conf"
+      ;;
+    *)
+      direct_file="$CONFIG_DIR/$NAME.conf"
+      ;;
+  esac
+  if [ -n "$direct_ip" ] && [ -n "$direct_file" ]; then
     render_client_config "$direct_ip" "$CLIENT_PRIVATE_KEY" >"$direct_file"
     chmod 0600 "$direct_file"
     CLIENT_DIRECT_FILE="$direct_file"
   fi
-  if [ -n "$warp_ip" ]; then
+  if [ -n "$warp_ip" ] && [ -n "$warp_file" ]; then
     render_client_config "$warp_ip" "$WARP_CLIENT_PRIVATE_KEY" >"$warp_file"
     chmod 0600 "$warp_file"
     CLIENT_WARP_FILE="$warp_file"
@@ -502,23 +517,23 @@ EOF
   printf '  server addr : %s\n' "$SERVER_ADDRESS"
   if [ -n "$direct_ip" ]; then
     printf '  direct addr : %s\n' "$direct_ip"
-    printf '  direct file : %s\n' "$direct_file"
+    printf '  direct file : %s\n' "$CLIENT_DIRECT_FILE"
   fi
   if [ -n "$warp_ip" ]; then
     printf '  warp addr   : %s\n' "$warp_ip"
-    printf '  warp file   : %s\n' "$warp_file"
+    printf '  warp file   : %s\n' "$CLIENT_WARP_FILE"
   fi
   printf '  rollback    : cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$backup" "$CONF" "$DEVICE" "$CONF"
 
   if [ "$PRINT_CONFIG" = "true" ]; then
-    if [ -r "$direct_file" ]; then
+    if [ -n "$CLIENT_DIRECT_FILE" ] && [ -r "$CLIENT_DIRECT_FILE" ]; then
       printf '\n----- BEGIN direct config (%s) -----\n' "$NAME"
-      cat "$direct_file"
+      cat "$CLIENT_DIRECT_FILE"
       printf -- '----- END direct config (%s) -----\n' "$NAME"
     fi
-    if [ -r "$warp_file" ]; then
+    if [ -n "$CLIENT_WARP_FILE" ] && [ -r "$CLIENT_WARP_FILE" ]; then
       printf '\n----- BEGIN WARP config (%s) -----\n' "$NAME"
-      cat "$warp_file"
+      cat "$CLIENT_WARP_FILE"
       printf -- '----- END WARP config (%s) -----\n' "$NAME"
     fi
   fi
@@ -633,7 +648,7 @@ remove_client() {
     unregister_warp_client "$wip"
   fi
 
-  rm -f "$state" "$CONFIG_DIR/$NAME-direct.conf" "$CONFIG_DIR/$NAME-warp.conf"
+  rm -f "$state" "$CONFIG_DIR/$NAME.conf" "$CONFIG_DIR/$NAME-direct.conf" "$CONFIG_DIR/$NAME-warp.conf"
   log "removed $NAME; other peers keep their tunnels"
   log "rollback: cp $backup $CONF && wg syncconf $DEVICE <(wg-quick strip $CONF)"
 }
@@ -708,11 +723,35 @@ interactive() {
   state_paths
 
   if [ "$MODE_SET" != "true" ]; then
-    prompt MODE "出口模式  direct=本机出口  warp=WARP出口  dual=两者都要" "dual"
+    while true; do
+      prompt MODE_CHOICE "出口模式" "3"
+      case "$MODE_CHOICE" in
+        1)
+          MODE="direct"
+          log "出口模式: direct（本机出口）"
+          break
+          ;;
+        2)
+          MODE="warp"
+          log "出口模式: warp（WARP 出口）"
+          break
+          ;;
+        3)
+          MODE="dual"
+          log "出口模式: dual（本机出口 + WARP 出口）"
+          break
+          ;;
+        *) log "请输入 1、2 或 3" ;;
+      esac
+    done
   fi
 
   if [ -z "$NAME" ]; then
-    prompt NAME "客户端名称（用于标记这台客户端）" "pc"
+    if [ "$MODE" = "warp" ]; then
+      prompt NAME "客户端名称（这条是 WARP 隧道，建议和直连那条区分开，例如 pc-warp）" "pc-warp"
+    else
+      prompt NAME "客户端名称（用于标记这台客户端）" "pc"
+    fi
   fi
 
   if [ -z "$CLIENT_PUBLIC_KEY" ]; then
@@ -727,31 +766,36 @@ interactive() {
     if [ -z "$CLIENT_PUBLIC_KEY" ]; then
       CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
     fi
-    log "已在本节点生成直连密钥对"
-    if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
+    log "已在本节点生成密钥对"
+    if [ "$MODE" = "dual" ]; then
       if [ -z "$WARP_CLIENT_PRIVATE_KEY" ]; then
         WARP_CLIENT_PRIVATE_KEY="$(wg genkey)"
       fi
       if [ -z "$WARP_CLIENT_PUBLIC_KEY" ]; then
         WARP_CLIENT_PUBLIC_KEY="$(printf '%s' "$WARP_CLIENT_PRIVATE_KEY" | wg pubkey)"
       fi
-      log "已在本节点生成 WARP 密钥对"
+      log "已在本节点生成第二条（WARP）密钥对"
     fi
   else
     while true; do
-      prompt CLIENT_PUBLIC_KEY "粘贴客户端直连公钥（WireGuard 生成，44 字符）" ""
+      prompt CLIENT_PUBLIC_KEY "粘贴客户端公钥（WireGuard 生成，44 字符）" ""
       if is_public_key "$CLIENT_PUBLIC_KEY"; then
         break
       fi
       log "公钥格式不对，请重新输入"
     done
-    if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
+    if [ "$MODE" = "dual" ]; then
       while true; do
-        prompt WARP_CLIENT_PUBLIC_KEY "粘贴客户端 WARP 公钥（可以复用上面同一个）" ""
+        prompt WARP_CLIENT_PUBLIC_KEY "粘贴第二条（WARP 隧道）公钥，必须和上面那条不同" ""
         if is_public_key "$WARP_CLIENT_PUBLIC_KEY"; then
-          break
+          if [ "$WARP_CLIENT_PUBLIC_KEY" = "$CLIENT_PUBLIC_KEY" ]; then
+            log "两条隧道不能用同一个公钥，请重新输入"
+          else
+            break
+          fi
+        else
+          log "公钥格式不对，请重新输入"
         fi
-        log "公钥格式不对，请重新输入"
       done
     fi
   fi
@@ -797,20 +841,30 @@ print_next_steps() {
   printf '\n'
   printf '===== 接下来在你电脑上做什么 =====\n'
   if [ -n "$CLIENT_DIRECT_FILE" ] && [ -r "$CLIENT_DIRECT_FILE" ]; then
-    printf '1. 取直连配置：%s\n' "$CLIENT_DIRECT_FILE"
+    printf '1. 取配置：%s\n' "$CLIENT_DIRECT_FILE"
   fi
   if [ -n "$CLIENT_WARP_FILE" ] && [ -r "$CLIENT_WARP_FILE" ]; then
-    printf '2. 取 WARP 配置：%s\n' "$CLIENT_WARP_FILE"
+    printf '2. 取配置：%s\n' "$CLIENT_WARP_FILE"
   fi
   printf '3. %s\n' "$key_note"
   printf '4. 用 WireGuard for Windows「添加空隧道 → 导入配置」导入\n'
-  printf '5. 两份配置 AllowedIPs 都是 0.0.0.0/0，一次只能启用其中一份\n'
-  printf '6. 启用后在本机执行：curl https://www.cloudflare.com/cdn-cgi/trace\n'
+  printf '5. 启用后在本机执行：curl https://www.cloudflare.com/cdn-cgi/trace\n'
   printf '   看 ip= 那一行确认出口已经变成目标机房\n'
-  if [ "$MODE" = "warp" ] || [ "$MODE" = "dual" ]; then
-    printf '\n注意：WARP 转发只处理 TCP，UDP 不会被转发也不会 NAT，会被丢弃。\n'
-    printf '      需要 UDP 就用直连那份配置。\n'
+
+  if [ "$MODE" = "direct" ]; then
+    printf '\n如果这台电脑还想要 WARP 出口：\n'
+    printf '  再跑一次 wpl-add-client，模式选 2，名称用 %s-warp，用另一组密钥\n' "$NAME"
   fi
+  if [ "$MODE" = "warp" ]; then
+    printf '\nWARP 转发只处理 TCP，UDP 不会被转发也不会 NAT，会被丢弃。\n'
+    printf '如果这台电脑还想要 UDP 可用的直连出口：\n'
+    printf '  再跑一次 wpl-add-client，模式选 1，名称用 %s-direct，用另一组密钥\n' "${NAME%-warp}"
+  fi
+  if [ "$MODE" = "dual" ]; then
+    printf '\n两份配置 AllowedIPs 都是 0.0.0.0/0，一次只能启用其中一份。\n'
+    printf 'WARP 那份只有 TCP 走 WARP；需要 UDP 时切换到直连那份。\n'
+  fi
+
   printf '\n回滚命令：\n'
   printf '  cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$ROLLBACK_BACKUP" "$CONF" "$DEVICE" "$CONF"
 }
