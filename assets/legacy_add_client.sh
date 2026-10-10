@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r14"
+SCRIPT_VERSION="2026.10.10-r15"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -343,15 +343,38 @@ render_hooks() {
 
 # The NAT address list is embedded in PostUp/PostDown ("for ip in A B; do"),
 # so the config file is the single source of truth and no external file has to
-# survive a reboot. This also reads the legacy external-file form so existing
-# deployments migrate on their next add/remove.
+# survive a reboot. Three source forms are recognised:
+#   1. the inline loop form this script writes
+#   2. the literal form the Go deploy path writes
+#      ("iptables -t nat -A POSTROUTING -s 10.0.0.2/32 -o eth0 -j MASQUERADE")
+#   3. the legacy external file
+# Missing form 2 is how a freshly deployed node silently lost its first
+# client's MASQUERADE rule: the rule survived in the running kernel, so nothing
+# looked wrong until the next reboot.
 read_nat_addresses() {
   {
     sed -n 's/.*for ip in \([^;]*\); do.*/\1/p' "$CONF" 2>/dev/null | tr ' ' '\n'
+    sed -n 's/.*POSTROUTING -s \([0-9.]*\)\/32 -o [^ ]* -j MASQUERADE.*/\1/p' "$CONF" 2>/dev/null
     if [ -r "$NAT_V4_FILE" ]; then
       cat "$NAT_V4_FILE"
     fi
   } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u || true
+}
+
+# IPv4 tunnel addresses present in the config but deliberately not NATed
+# (WARP-only peers). Printed so a missing direct client is visible.
+unnatd_addresses() {
+  local a
+  sed -n 's/^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null |
+    tr ',' '\n' | sed 's/^[[:space:]]*//; s|/.*||' |
+    grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u |
+    while read -r a; do
+      [ -n "$a" ] || continue
+      if ! printf '%s\n' $1 | grep -qxF "$a"; then
+        printf '%s\n' "$a"
+      fi
+    done | tr '\n' ' ' | sed 's/ *$//'
+  return 0
 }
 
 render_peer() {
@@ -465,6 +488,11 @@ add_client() {
     fail "the NAT address list would become empty; refusing to proceed because every direct peer would lose its MASQUERADE rule. Inspect $CONF before retrying."
   fi
   log "NAT address list embedded into PostUp: $nat_list"
+  local not_natd
+  not_natd="$(unnatd_addresses "$nat_list")"
+  if [ -n "$not_natd" ]; then
+    log "not NATed (treated as WARP-only tunnels): $not_natd"
+  fi
 
   # 2. Render the new config. The Interface section is rebuilt explicitly so
   #    that SaveConfig and the PostUp/PostDown hooks stay INSIDE the section:
