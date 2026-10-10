@@ -537,6 +537,80 @@ curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/
 
 ---
 
+## 出口节点：非主服务器客户端
+
+共享 Push 节点除了主服务器，也可以接入本地电脑、手机等**非主服务器**客户端：它们不需要装 WarpPool，只要一条 WireGuard 客户端配置。
+
+在出口节点上直接执行：
+
+```bash
+# 查看脚本是否在节点上
+ls -l /tmp/warppool-install/shared_node.sh
+
+# 没有就下载
+curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/shared_node.sh -o /root/shared_node.sh
+```
+
+### 列出所有 peer
+
+```bash
+bash /root/shared_node.sh action=list
+```
+
+### 新增一个客户端
+
+```bash
+bash /root/shared_node.sh action=add-client \
+  name=pc \
+  mode=direct \
+  endpoint=<出口节点公网IP>:<NAT映射后的公网UDP端口>
+```
+
+命令会完成四件事：
+
+1. 生成客户端密钥对（也可以用 `client_private_key=<key>` 自带私钥，公私钥分离更安全）
+2. 追加 peer 并热更新 WireGuard 接口，不影响已有主服务器隧道
+3. `warp` / `dual` 模式自动注册 WARP 转发
+4. 生成可直接导入的完整客户端配置
+
+输出配置默认写到 `/root/warppool-clients/<name>.conf`，也直接打印到终端。用 `config_dir=` 换目录，用 `print_config=false` 只写文件不打印。
+
+`endpoint=` 是**客户端要连的地址**，NAT VPS 上必须填公网映射端口，不是节点本机 `listen_port`。不传会尝试自动探测公网 IP，NAT 机器上通常探测不准。
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `mode=` | `direct` 走子服务器本机出口；`warp` 走 WARP 出口；`dual` 同时生成两条隧道 |
+| `allowed_ips=` | 默认 `0.0.0.0/0, ::/0`（全局隧道）；只想访问内网可改成 `10.200.0.0/24` |
+| `dns=` | 默认 `1.1.1.1, 8.8.8.8` |
+| `config_dir=` | 配置输出目录，默认 `/root/warppool-clients` |
+| `register_warp=` | `false` 时跳过 WARP 转发注册 |
+
+`mode=dual` 会生成两份配置，**一次只能启用一条**：
+
+```text
+pc.conf       直连出口，UDP 可用
+pc-warp.conf  WARP 出口，仅 TCP
+```
+
+### WARP 模式的限制
+
+WARP 转发只重定向 **TCP**（`iptables -t nat PREROUTING ... -p tcp -j REDIRECT`）。`warp` 模式下该客户端的 UDP 不会被转发到 WARP，也不做 NAT，会被丢弃。
+
+需要 UDP 就用 `direct`，或者用 `dual` 拿到两条隧道分开用。
+
+### 移除客户端
+
+```bash
+bash /root/shared_node.sh action=remove target=pc
+bash /root/shared_node.sh action=remove target=<公钥>   # 也可以用公钥定位
+```
+
+移除会重渲染配置、`wg syncconf` 热更新、清理该 IP 的 MASQUERADE 规则，并在 WARP 模式下注销转发客户端。其它 peer 的隧道不受影响。
+
+---
+
 ## 配置
 
 默认配置路径：
@@ -571,4 +645,5 @@ curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/
 
 - 没有 Web UI。
 - 共享多主服务器复用同一出口节点目前先支持 SSH Push 部署；Pull / Deploy Token 暂时保持原有单次注册流程。
+- 非主服务器客户端接入（`shared_node.sh action=add-client`）要求节点使用共享 Push 布局（`wpshared`）；旧版独占 `wp<name>` 节点不支持。
 - `upgrade` 会更新主程序二进制和内置安装脚本资源，但不会修改现有配置文件。

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added `shared_node.sh action=add-client` for non-main-server clients (local PC, phone, secondary machines). It appends a peer, hot-reloads the interface without touching existing tunnels, registers WARP forwarding for `warp`/`dual` mode, and renders a ready-to-import full-tunnel WireGuard client config to `/root/warppool-clients`.
+- Added `shared_node.sh action=list` and `shared_node.sh action=remove target=<label|public-key>`. Removal re-renders the config, syncs it live, purges the removed peer's MASQUERADE rules, and unregisters its WARP forwarding client.
+- `shared_node.sh` now records a `NAME` and the optional client private keys per peer, so clients can be re-exported and identified. Existing peers without these fields keep working.
+- Added `warp_forward.sh action=register`, which adds one more client to an already running forwarder without restarting it, falling back to a full startup when no forwarder is running. Manual `shared_node.sh action=add mode=warp` is now self-sufficient instead of requiring the Go deploy path to finish WARP wiring.
+- `shared_node.sh` can now fetch sibling helper scripts from the release URL when they are not next to the script itself.
+
 ## v0.1.12
 
 - Added shared SSH Push exit-node layout. Multiple main servers can now deploy to the same exit node; the node keeps one shared WireGuard device (`wpshared`) and appends peers instead of overwriting existing peers.

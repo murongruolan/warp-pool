@@ -566,6 +566,78 @@ curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/
 
 ---
 
+## Exit Node: Non-Main-Server Clients
+
+A shared Push node can accept clients other than main servers: a local PC, a phone, or any second machine that only needs a WireGuard client config and does not run WarpPool.
+
+Run this on the exit node:
+
+```bash
+# The script is usually already uploaded by Push deployment
+ls -l /tmp/warppool-install/shared_node.sh
+
+# Otherwise download it
+curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/shared_node.sh -o /root/shared_node.sh
+```
+
+### List every peer
+
+```bash
+bash /root/shared_node.sh action=list
+```
+
+### Add a client
+
+```bash
+bash /root/shared_node.sh action=add-client \
+  name=pc \
+  mode=direct \
+  endpoint=<exit-node-public-ip>:<nat-mapped-public-udp-port>
+```
+
+One command does four things:
+
+1. Generates the client keypair (supply `client_private_key=<key>` to keep the private key off the exit node)
+2. Appends the peer and hot-reloads the WireGuard interface, leaving existing main-server tunnels untouched
+3. Registers WARP forwarding automatically for `warp` / `dual` mode
+4. Renders a complete, ready-to-import WireGuard client config
+
+Configs are written to `/root/warppool-clients/<name>.conf` and also printed to stdout. Use `config_dir=` to change the directory and `print_config=false` to only write files.
+
+`endpoint=` is the address the **client** dials. On a NAT VPS this must be the public mapped port, not the node's local `listen_port`. Without it the script tries to detect the public IP, which is usually wrong on a NAT host.
+
+| Option | Description |
+| --- | --- |
+| `mode=` | `direct` for the node's own egress IP, `warp` for WARP egress, `dual` for both |
+| `allowed_ips=` | Defaults to `0.0.0.0/0, ::/0` (full tunnel); use `10.200.0.0/24` for split tunnel |
+| `dns=` | Defaults to `1.1.1.1, 8.8.8.8` |
+| `config_dir=` | Output directory, defaults to `/root/warppool-clients` |
+| `register_warp=` | Set `false` to skip WARP forwarding registration |
+
+`mode=dual` writes two configs and only one may be active at a time:
+
+```text
+pc.conf       direct egress, UDP works
+pc-warp.conf  WARP egress, TCP only
+```
+
+### WARP mode limitation
+
+WARP forwarding only redirects **TCP** (`iptables -t nat PREROUTING ... -p tcp -j REDIRECT`). In `warp` mode a client's UDP is neither redirected to WARP nor NATed, so it is dropped.
+
+Use `direct` when you need UDP, or use `dual` to get both tunnels and pick per traffic type.
+
+### Remove a client
+
+```bash
+bash /root/shared_node.sh action=remove target=pc
+bash /root/shared_node.sh action=remove target=<public-key>   # target by public key instead
+```
+
+Removal re-renders the config, hot-reloads with `wg syncconf`, purges that IP's MASQUERADE rules, and unregisters the WARP forwarding client. Other peers keep their tunnels.
+
+---
+
 ## Configuration
 
 Default config path:
@@ -629,4 +701,5 @@ The script checks the working tree, updates `VERSION`, creates a Chinese commit,
 - No multi-user permission model.
 - No remote Agent.
 - Shared multi-main-server exit-node reuse is currently implemented for SSH Push deployment. Pull / Deploy Token keep the original single-registration flow for now.
+- Non-main-server client access (`shared_node.sh action=add-client`) requires a node using the shared Push layout (`wpshared`). Legacy exclusive `wp<name>` nodes are not supported.
 - `upgrade` updates the main binary and bundled installer assets. Existing config is preserved.

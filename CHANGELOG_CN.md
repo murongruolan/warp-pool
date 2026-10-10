@@ -2,6 +2,12 @@
 
 ## 未发布
 
+- 新增 `shared_node.sh action=add-client`，用于接入非主服务器客户端（本地电脑、手机等）。它会追加 peer、热更新接口而不影响已有隧道、为 `warp`/`dual` 模式注册 WARP 转发，并把可直接导入的全局隧道客户端配置写到 `/root/warppool-clients`。
+- 新增 `shared_node.sh action=list` 和 `shared_node.sh action=remove target=<名称|公钥>`。移除会重渲染配置、同步生效、清理该 peer 的 MASQUERADE 规则，并注销它的 WARP 转发客户端。
+- `shared_node.sh` 现在为每个 peer 记录 `NAME` 和可选的客户端私钥，便于重新导出和识别客户端。已有 peer 缺少这些字段仍然兼容。
+- 新增 `warp_forward.sh action=register`，在转发器已经运行时直接追加客户端而不重启；没有转发器运行时回退到完整启动流程。手动执行 `shared_node.sh action=add mode=warp` 现在自成一体，不再依赖 Go 部署流程补 WARP 接线。
+- `shared_node.sh` 在同目录缺少配套脚本时，可以从发布地址自动下载。
+
 ## v0.1.12
 
 - 新增 SSH Push 共享出口节点布局。多台主服务器可以部署到同一个出口节点；出口节点只维护一个共享 WireGuard 设备 `wpshared`，后续部署会追加 peer，不再覆盖已有 peer。
