@@ -23,6 +23,12 @@ TRANSPARENT_PORT="14000"
 REGISTER_WARP="true"
 PRINT_CONFIG="true"
 DRY_RUN="false"
+INTERACTIVE="false"
+MODE_SET="false"
+KEY_SOURCE="1"
+CLIENT_DIRECT_FILE=""
+CLIENT_WARP_FILE=""
+ROLLBACK_BACKUP=""
 STATE_DIR="/etc/warppool-node/legacy-clients"
 BASE_URL="${WARPPOOL_INSTALL_BASE_URL:-${WARPOOL_INSTALL_BASE_URL:-https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets}}"
 DOWNLOAD_DIR="/tmp/warppool-legacy.$$"
@@ -57,6 +63,14 @@ usage() {
 WarpPool legacy node client helper
 
 Usage:
+  bash legacy_add_client.sh
+  bash legacy_add_client.sh -i
+  wpl-add-client
+
+  The commands above start a guided setup. It asks for the exit-node device,
+  the exit mode, the client label, the client public key, and the public
+  endpoint, then shows a preview and waits for confirmation.
+
   bash legacy_add_client.sh action=add \
       device=wp2-1 mode=direct|warp|dual name=<label> \
       client_public_key=<key> [warp_client_public_key=<key>] \
@@ -74,8 +88,10 @@ addresses into a loop over a NAT address file, so newly added direct clients
 survive a reboot. The change is applied with `wg syncconf`; the interface is
 never brought down.
 
-Only the PUBLIC key of the client is required. Private keys stay on the
-client machine; the generated config files carry a PrivateKey placeholder.
+Only the PUBLIC key of the client is normally required. Private keys stay on
+the client machine and the generated config carries a PrivateKey placeholder.
+Choosing key source 2 in the guided setup generates the keypair on this node
+instead and writes the private key straight into the config.
 USAGE
 }
 
@@ -89,9 +105,12 @@ parse_args() {
       --dry-run)
         DRY_RUN="true"
         ;;
+      -i|--interactive)
+        INTERACTIVE="true"
+        ;;
       action=*) ACTION="${arg#action=}" ;;
       device=*) DEVICE="${arg#device=}" ;;
-      mode=*) MODE="${arg#mode=}" ;;
+      mode=*) MODE="${arg#mode=}"; MODE_SET="true" ;;
       name=*) NAME="${arg#name=}" ;;
       client_public_key=*) CLIENT_PUBLIC_KEY="${arg#client_public_key=}" ;;
       warp_client_public_key=*) WARP_CLIENT_PUBLIC_KEY="${arg#warp_client_public_key=}" ;;
@@ -412,6 +431,7 @@ add_client() {
 
   cp -a "$CONF" "$backup"
   log "backup: $backup"
+  ROLLBACK_BACKUP="$backup"
 
   sort -u -o "$NAT_V4_FILE" "$NAT_V4_FILE.seed"
   rm -f "$NAT_V4_FILE.seed"
@@ -443,16 +463,20 @@ add_client() {
   # 7. Client configs.
   mkdir -p "$CONFIG_DIR"
   chmod 0700 "$CONFIG_DIR"
+  CLIENT_DIRECT_FILE=""
+  CLIENT_WARP_FILE=""
   local direct_file warp_file
   direct_file="$CONFIG_DIR/$NAME-direct.conf"
   warp_file="$CONFIG_DIR/$NAME-warp.conf"
   if [ -n "$direct_ip" ]; then
     render_client_config "$direct_ip" "$CLIENT_PRIVATE_KEY" >"$direct_file"
     chmod 0600 "$direct_file"
+    CLIENT_DIRECT_FILE="$direct_file"
   fi
   if [ -n "$warp_ip" ]; then
     render_client_config "$warp_ip" "$WARP_CLIENT_PRIVATE_KEY" >"$warp_file"
     chmod 0600 "$warp_file"
+    CLIENT_WARP_FILE="$warp_file"
   fi
 
   cat >"$CLIENT_STATE_DIR/$NAME.env" <<EOF
@@ -460,8 +484,10 @@ NAME='$NAME'
 MODE='$MODE'
 CREATED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
 CLIENT_PUBLIC_KEY='$CLIENT_PUBLIC_KEY'
+CLIENT_PRIVATE_KEY='$CLIENT_PRIVATE_KEY'
 CLIENT_IPV4='$direct_ip'
 WARP_CLIENT_PUBLIC_KEY='$WARP_CLIENT_PUBLIC_KEY'
+WARP_CLIENT_PRIVATE_KEY='$WARP_CLIENT_PRIVATE_KEY'
 WARP_CLIENT_IPV4='$warp_ip'
 ENDPOINT='$ENDPOINT'
 EOF
@@ -612,8 +638,191 @@ remove_client() {
   log "rollback: cp $backup $CONF && wg syncconf $DEVICE <(wg-quick strip $CONF)"
 }
 
+install_shortcut() {
+  local target="/usr/local/bin/wpl-add-client"
+  local src dir
+  if [ "${INSTALL_SHORTCUT:-true}" = "false" ]; then
+    return 0
+  fi
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+  src="$dir/$(basename -- "${BASH_SOURCE[0]}")"
+  [ "$src" != "$target" ] || return 0
+  if ln -sf "$src" "$target" 2>/dev/null; then
+    chmod 0755 "$target" 2>/dev/null || true
+    log "已安装短命令: $target"
+  elif cp -f "$src" "$target" 2>/dev/null; then
+    chmod 0755 "$target" 2>/dev/null || true
+    log "已安装短命令: $target"
+  fi
+  return 0
+}
+
+prompt() {
+  local var="$1" label="$2" default="${3:-}" reply
+  if [ -n "$default" ]; then
+    printf '%s [%s]: ' "$label" "$default" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  if ! IFS= read -r reply; then
+    fail "no input received; nothing was changed"
+  fi
+  reply="${reply:-$default}"
+  reply="$(printf '%s' "$reply" | tr -d '[:space:]')"
+  printf -v "$var" '%s' "$reply"
+}
+
+detect_single_device() {
+  local found
+  found="$(find /etc/wireguard -maxdepth 1 -name 'wp*.conf' -type f 2>/dev/null | sort)"
+  local count
+  count="$(printf '%s\n' "$found" | grep -c . || true)"
+  if [ "$count" -eq 1 ]; then
+    basename "$found" .conf
+    return 0
+  fi
+  return 1
+}
+
+last_known_endpoint() {
+  local f
+  for f in "$CLIENT_STATE_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    grep -h '^ENDPOINT=' "$f" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d "'"
+  done
+}
+
+interactive() {
+  ACTION="add"
+  install_shortcut
+  printf '\n'
+  printf '===== WarpPool 出口节点：接入非主服务器客户端 =====\n\n'
+
+  if [ -z "$DEVICE" ]; then
+    if DEVICE="$(detect_single_device)"; then
+      log "自动识别出口节点设备: $DEVICE"
+    else
+      prompt DEVICE "出口节点 WireGuard 设备名（/etc/wireguard/<name>.conf）" ""
+    fi
+  fi
+  state_paths
+
+  if [ "$MODE_SET" != "true" ]; then
+    prompt MODE "出口模式  direct=本机出口  warp=WARP出口  dual=两者都要" "dual"
+  fi
+
+  if [ -z "$NAME" ]; then
+    prompt NAME "客户端名称（用于标记这台客户端）" "pc"
+  fi
+
+  if [ -z "$CLIENT_PUBLIC_KEY" ]; then
+    prompt KEY_SOURCE "客户端密钥来源  1=我在电脑上生成好了，现在粘贴公钥  2=由本节点生成密钥对" "1"
+  fi
+
+  if [ "$KEY_SOURCE" = "2" ]; then
+    require_command wg
+    if [ -z "$CLIENT_PRIVATE_KEY" ]; then
+      CLIENT_PRIVATE_KEY="$(wg genkey)"
+    fi
+    if [ -z "$CLIENT_PUBLIC_KEY" ]; then
+      CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
+    fi
+    log "已在本节点生成直连密钥对"
+    if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
+      if [ -z "$WARP_CLIENT_PRIVATE_KEY" ]; then
+        WARP_CLIENT_PRIVATE_KEY="$(wg genkey)"
+      fi
+      if [ -z "$WARP_CLIENT_PUBLIC_KEY" ]; then
+        WARP_CLIENT_PUBLIC_KEY="$(printf '%s' "$WARP_CLIENT_PRIVATE_KEY" | wg pubkey)"
+      fi
+      log "已在本节点生成 WARP 密钥对"
+    fi
+  else
+    while true; do
+      prompt CLIENT_PUBLIC_KEY "粘贴客户端直连公钥（WireGuard 生成，44 字符）" ""
+      if is_public_key "$CLIENT_PUBLIC_KEY"; then
+        break
+      fi
+      log "公钥格式不对，请重新输入"
+    done
+    if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
+      while true; do
+        prompt WARP_CLIENT_PUBLIC_KEY "粘贴客户端 WARP 公钥（可以复用上面同一个）" ""
+        if is_public_key "$WARP_CLIENT_PUBLIC_KEY"; then
+          break
+        fi
+        log "公钥格式不对，请重新输入"
+      done
+    fi
+  fi
+
+  if [ -z "$ENDPOINT" ]; then
+    local hint
+    hint="$(last_known_endpoint)"
+    prompt ENDPOINT "客户端要连接的公网 endpoint（NAT 映射后的 地址:端口）" "$hint"
+  fi
+  if [ -z "$ENDPOINT" ]; then
+    fail "endpoint is required"
+  fi
+
+  printf '\n'
+  NAME="$(sanitize_name "$NAME")"
+  printf '即将执行：\n'
+  printf '  出口节点设备 : %s\n' "$DEVICE"
+  printf '  出口模式     : %s\n' "$MODE"
+  printf '  客户端名称   : %s\n' "$NAME"
+  printf '  直连公钥     : %s\n' "$CLIENT_PUBLIC_KEY"
+  if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
+    printf '  WARP 公钥    : %s\n' "$WARP_CLIENT_PUBLIC_KEY"
+  fi
+  printf '  公网 endpoint: %s\n' "$ENDPOINT"
+  printf '\n确认执行？输入 yes 继续，其他任意键取消：'
+  local answer
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    yes|Yes|YES|y|Y) ;;
+    *)
+      printf '\n已取消，未做任何改动。\n'
+      exit 0
+      ;;
+  esac
+  printf '\n'
+}
+
+print_next_steps() {
+  local key_note="PrivateKey = REPLACE_WITH_YOUR_PRIVATE_KEY"
+  if [ -n "$CLIENT_PRIVATE_KEY" ]; then
+    key_note="PrivateKey 已由本节点生成，直接可用"
+  fi
+  printf '\n'
+  printf '===== 接下来在你电脑上做什么 =====\n'
+  if [ -n "$CLIENT_DIRECT_FILE" ] && [ -r "$CLIENT_DIRECT_FILE" ]; then
+    printf '1. 取直连配置：%s\n' "$CLIENT_DIRECT_FILE"
+  fi
+  if [ -n "$CLIENT_WARP_FILE" ] && [ -r "$CLIENT_WARP_FILE" ]; then
+    printf '2. 取 WARP 配置：%s\n' "$CLIENT_WARP_FILE"
+  fi
+  printf '3. %s\n' "$key_note"
+  printf '4. 用 WireGuard for Windows「添加空隧道 → 导入配置」导入\n'
+  printf '5. 两份配置 AllowedIPs 都是 0.0.0.0/0，一次只能启用其中一份\n'
+  printf '6. 启用后在本机执行：curl https://www.cloudflare.com/cdn-cgi/trace\n'
+  printf '   看 ip= 那一行确认出口已经变成目标机房\n'
+  if [ "$MODE" = "warp" ] || [ "$MODE" = "dual" ]; then
+    printf '\n注意：WARP 转发只处理 TCP，UDP 不会被转发也不会 NAT，会被丢弃。\n'
+    printf '      需要 UDP 就用直连那份配置。\n'
+  fi
+  printf '\n回滚命令：\n'
+  printf '  cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$ROLLBACK_BACKUP" "$CONF" "$DEVICE" "$CONF"
+}
+
 main() {
   parse_args "$@"
+  require_root
+  local was_interactive="false"
+  if [ "$#" -eq 0 ] || [ "$INTERACTIVE" = "true" ]; then
+    was_interactive="true"
+    interactive
+  fi
   validate_args
   state_paths
   require_root
@@ -621,6 +830,9 @@ main() {
   case "$ACTION" in
     add)
       add_client
+      if [ "$was_interactive" = "true" ]; then
+        print_next_steps
+      fi
       ;;
     list)
       list_clients
