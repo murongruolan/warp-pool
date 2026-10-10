@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_VERSION="2026.10.11-r3"
+WPLS_VERSION="2026.10.11-r4"
 
 # wpls - WarpPool exit-node connection manager.
 #
@@ -692,7 +692,8 @@ cmd_edit() {
   [ -r "$rpath" ] || fail "找不到登记文件: $rpath"
 
   local NAME="" MODE="" KIND="" DEVICE="" PORT="" CLIENT_PUBLIC_KEY=""
-  local CLIENT_IPV4="" WARP_CLIENT_PUBLIC_KEY="" WARP_CLIENT_IPV4="" ENDPOINT=""
+  local CLIENT_PRIVATE_KEY="" WARP_CLIENT_PUBLIC_KEY="" WARP_CLIENT_PRIVATE_KEY=""
+  local CLIENT_IPV4="" WARP_CLIENT_IPV4="" ENDPOINT=""
   # shellcheck disable=SC1090
   . "$rpath"
   mode="${MODE:-direct}"
@@ -701,6 +702,11 @@ cmd_edit() {
   local kind="${KIND:-wg}"
   local port="${PORT:-}"
   local endpoint="${ENDPOINT:-}"
+  # A keypair generated on this node is stored in the record. The address edit
+  # is a remove + re-add, so both halves have to be handed back on the re-add:
+  # without the private half the exported config would silently lose its key.
+  local cpriv="${CLIENT_PRIVATE_KEY:-}"
+  local wpriv="${WARP_CLIENT_PRIVATE_KEY:-}"
 
   info ""
   info "即将修改：$name（设备 $rdev）"
@@ -741,7 +747,9 @@ cmd_edit() {
   local -a addargs=(action=add "device=$rdev" "mode=$mode" "name=$name"
                     "client_public_key=$oldkey" "client_ip=$newvalue")
   [ -n "$endpoint" ] && addargs+=("endpoint=$endpoint")
+  [ -n "$cpriv" ] && addargs+=("client_private_key=$cpriv")
   [ -n "$WARP_CLIENT_PUBLIC_KEY" ] && addargs+=("warp_client_public_key=$WARP_CLIENT_PUBLIC_KEY")
+  [ -n "$wpriv" ] && addargs+=("warp_client_private_key=$wpriv")
 
   local recbak="$rpath.bak.$$"
   cp -a "$rpath" "$recbak" 2>/dev/null || :

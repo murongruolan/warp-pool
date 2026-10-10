@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r15"
+SCRIPT_VERSION="2026.10.10-r16"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -526,7 +526,11 @@ add_client() {
     if [ "$MODE" = "dual" ]; then
       render_peer "$WARP_CLIENT_PUBLIC_KEY" "$warp_ip"
     fi
-  } >"$tmp"
+  } >"$tmp.raw"
+  # Squeeze repeated blank lines: a remove+re-add cycle would otherwise add one
+  # blank line before the last [Peer] every time.
+  cat -s "$tmp.raw" >"$tmp"
+  rm -f "$tmp.raw"
   chmod 0600 "$tmp"
 
   log "new config rendered: $tmp"
@@ -736,10 +740,10 @@ remove_client() {
   # Drop whole [Peer] paragraphs whose PublicKey matches. Paragraph mode keeps
   # every other line of the file byte-identical.
   awk -v k1="$cpub" -v k2="$wpub" '
-    BEGIN { RS = "" }
+    BEGIN { RS = ""; sep = "" }
     index($0, "PublicKey = " k1) > 0 { next }
     k2 != "" && index($0, "PublicKey = " k2) > 0 { next }
-    { printf "%s\n\n", $0 }
+    { printf "%s%s\n", sep, $0; sep = "\n" }
   ' "$CONF" >"$tmp"
 
   # Drop the removed address from the inline NAT list in PostUp/PostDown.
