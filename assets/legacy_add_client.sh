@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r7"
+SCRIPT_VERSION="2026.10.10-r8"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -972,7 +972,16 @@ rotate_client() {
   NAME="$(sanitize_name "$NAME")"
   local state="$CLIENT_STATE_DIR/$NAME.env"
   [ -r "$state" ] || fail "no managed client named $NAME (see action=list)"
-  is_public_key "$CLIENT_PUBLIC_KEY" || fail "client_public_key does not look like a WireGuard public key"
+
+  # Capture the incoming keys BEFORE sourcing the state record: the .env file
+  # overwrites these same globals with the CURRENT values.
+  local new_cpub="$CLIENT_PUBLIC_KEY"
+  local new_wpub="$WARP_CLIENT_PUBLIC_KEY"
+
+  is_public_key "$new_cpub" || fail "client_public_key does not look like a WireGuard public key"
+  if [ -n "$new_wpub" ]; then
+    is_public_key "$new_wpub" || fail "warp_client_public_key does not look like a WireGuard public key"
+  fi
   load_conf_meta
 
   local old_cpub old_wpub dip wip mode endpoint created ts backup tmp
@@ -996,22 +1005,22 @@ rotate_client() {
 
   log "rotating keys for $NAME (created $created, mode $mode)"
   log "  old direct key: $old_cpub"
-  log "  new direct key: $CLIENT_PUBLIC_KEY"
-  if [ -n "$old_wpub" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+  log "  new direct key: $new_cpub"
+  if [ -n "$old_wpub" ] && [ -n "$new_wpub" ]; then
     log "  old warp key  : $old_wpub"
-    log "  new warp key  : $WARP_CLIENT_PUBLIC_KEY"
+    log "  new warp key  : $new_wpub"
   fi
 
-  if [ "$CLIENT_PUBLIC_KEY" = "$old_cpub" ]; then
+  if [ "$new_cpub" = "$old_cpub" ]; then
     fail "the new client_public_key is identical to the current one"
   fi
-  if [ -n "$old_wpub" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ] && [ "$WARP_CLIENT_PUBLIC_KEY" = "$old_wpub" ]; then
+  if [ -n "$old_wpub" ] && [ -n "$new_wpub" ] && [ "$new_wpub" = "$old_wpub" ]; then
     fail "the new warp_client_public_key is identical to the current one"
   fi
-  if grep -Fxq "PublicKey = $CLIENT_PUBLIC_KEY" "$CONF"; then
+  if grep -Fxq "PublicKey = $new_cpub" "$CONF"; then
     fail "the new client_public_key already exists in $CONF"
   fi
-  if [ -n "$WARP_CLIENT_PUBLIC_KEY" ] && grep -Fxq "PublicKey = $WARP_CLIENT_PUBLIC_KEY" "$CONF"; then
+  if [ -n "$new_wpub" ] && grep -Fxq "PublicKey = $new_wpub" "$CONF"; then
     fail "the new warp_client_public_key already exists in $CONF"
   fi
 
@@ -1019,8 +1028,8 @@ rotate_client() {
   backup="$CONF.bak.$ts"
   tmp="/tmp/$DEVICE.rotate.$$.conf"
 
-  awk -v o1="$old_cpub" -v n1="$CLIENT_PUBLIC_KEY" \
-      -v o2="$old_wpub" -v n2="$WARP_CLIENT_PUBLIC_KEY" '
+  awk -v o1="$old_cpub" -v n1="$new_cpub" \
+      -v o2="$old_wpub" -v n2="$new_wpub" '
     $0 == "PublicKey = " o1 { print "PublicKey = " n1; rotated++; next }
     o2 != "" && $0 == "PublicKey = " o2 { print "PublicKey = " n2; rotated++; next }
     { print }
@@ -1030,13 +1039,13 @@ rotate_client() {
 
   local expected_hits
   expected_hits=1
-  if [ -n "$old_wpub" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+  if [ -n "$old_wpub" ] && [ -n "$new_wpub" ]; then
     expected_hits=2
   fi
-  if [ "$(grep -cF "PublicKey = $CLIENT_PUBLIC_KEY" "$tmp" || true)" -lt 1 ]; then
+  if [ "$(grep -cF "PublicKey = $new_cpub" "$tmp" || true)" -lt 1 ]; then
     fail "new direct key missing from rendered config; nothing was changed"
   fi
-  if [ "$expected_hits" -eq 2 ] && [ "$(grep -cF "PublicKey = $WARP_CLIENT_PUBLIC_KEY" "$tmp" || true)" -lt 1 ]; then
+  if [ "$expected_hits" -eq 2 ] && [ "$(grep -cF "PublicKey = $new_wpub" "$tmp" || true)" -lt 1 ]; then
     fail "new WARP key missing from rendered config; nothing was changed"
   fi
   if grep -Fq "$old_cpub" "$tmp"; then
@@ -1087,10 +1096,10 @@ NAME='$NAME'
 MODE='$mode'
 CREATED_AT='$created'
 ROTATED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
-CLIENT_PUBLIC_KEY='$CLIENT_PUBLIC_KEY'
+CLIENT_PUBLIC_KEY='$new_cpub'
 CLIENT_PRIVATE_KEY='$cpriv'
 CLIENT_IPV4='$dip'
-WARP_CLIENT_PUBLIC_KEY='$WARP_CLIENT_PUBLIC_KEY'
+WARP_CLIENT_PUBLIC_KEY='$new_wpub'
 WARP_CLIENT_PRIVATE_KEY='$wpriv'
 WARP_CLIENT_IPV4='$wip'
 ENDPOINT='$endpoint'
@@ -1118,9 +1127,9 @@ EOF
   printf '  name         : %s\n' "$NAME"
   printf '  direct addr  : %s   (unchanged)\n' "${dip:-none}"
   printf '  warp addr    : %s   (unchanged)\n' "${wip:-none}"
-  printf '  new direct pk: %s\n' "$CLIENT_PUBLIC_KEY"
-  if [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
-    printf '  new warp pk  : %s\n' "$WARP_CLIENT_PUBLIC_KEY"
+  printf '  new direct pk: %s\n' "$new_cpub"
+  if [ -n "$new_wpub" ]; then
+    printf '  new warp pk  : %s\n' "$new_wpub"
   fi
   printf '  rollback     : cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$backup" "$CONF" "$DEVICE" "$CONF"
   printf '\n  update the client config on your machine with the new public key.\n'
