@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r18"
+SCRIPT_VERSION="2026.10.10-r19"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -376,17 +376,26 @@ read_nat_addresses() {
 
 # IPv4 tunnel addresses present in the config but deliberately not NATed
 # (WARP-only peers). Printed so a missing direct client is visible.
+#
+# The candidate list is captured into a variable and the pipeline ends with
+# `|| true`: with `set -o pipefail` a grep that matches nothing (a config with
+# no peers yet, which is exactly what action=init produces) would otherwise
+# abort the whole run.
 unnatd_addresses() {
-  local a
-  sed -n 's/^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null |
-    tr ',' '\n' | sed 's/^[[:space:]]*//; s|/.*||' |
-    grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u |
-    while read -r a; do
-      [ -n "$a" ] || continue
-      if ! printf '%s\n' $1 | grep -qxF "$a"; then
-        printf '%s\n' "$a"
-      fi
-    done | tr '\n' ' ' | sed 's/ *$//'
+  local nat_list="$1" candidates
+  candidates="$(sed -n 's/^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null |
+    tr ',' '\n' |
+    sed 's/^[[:space:]]*//; s|/.*||' |
+    grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' |
+    sort -u || true)"
+  [ -n "$candidates" ] || return 0
+  # awk exits 0 even with no output, unlike grep, so this filter is pipefail-safe.
+  printf '%s\n' "$candidates" |
+    awk -v list="$nat_list" '
+      BEGIN { n = split(list, arr, " "); for (i = 1; i <= n; i++) nat[arr[i]] = 1; sep = "" }
+      !($0 in nat) { printf "%s%s", sep, $0; sep = " " }
+      END { if (sep != "") printf "\n" }
+    ' || true
   return 0
 }
 
@@ -495,12 +504,14 @@ add_client() {
     if [ -n "$direct_ip" ]; then
       printf '%s\n' "$direct_ip"
     fi
-  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)"
 
-  if [ -z "$nat_list" ]; then
-    fail "the NAT address list would become empty; refusing to proceed because every direct peer would lose its MASQUERADE rule. Inspect $CONF before retrying."
+  # An empty list is only an error when a direct client was just allocated:
+  # a warp-only node legitimately has no NATed addresses at all.
+  if [ -n "$direct_ip" ] && ! printf '%s\n' $nat_list | grep -qxF "$direct_ip"; then
+    fail "the new direct address $direct_ip is missing from the NAT list; refusing to proceed. Inspect $CONF before retrying."
   fi
-  log "NAT address list embedded into PostUp: $nat_list"
+  log "NAT address list embedded into PostUp: ${nat_list:-<empty, no direct clients>}"
   local not_natd
   not_natd="$(unnatd_addresses "$nat_list")"
   if [ -n "$not_natd" ]; then
@@ -1349,17 +1360,33 @@ that this changes the server key and invalidates every existing client config."
   install -m 0600 "$tmp" "$CONF"
   log "installed: $CONF"
 
-  if ip link show "$DEVICE" >/dev/null 2>&1; then
-    log "interface $DEVICE already exists; syncing"
-    wg syncconf "$DEVICE" <(wg-quick strip "$CONF")
+  # Prefer systemd so the unit owns the interface from the start. Bringing it up
+  # with a bare `wg-quick up` leaves the unit inactive, and a later
+  # `systemctl start` then fails with "interface already exists".
+  local use_systemd="false"
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    use_systemd="true"
+  fi
+
+  if [ "$use_systemd" = "true" ]; then
+    systemctl enable "wg-quick@$DEVICE" >/dev/null 2>&1 || true
+    install_resilient_dropin "$DEVICE"
+    log "starting interface via systemd: wg-quick@$DEVICE"
+    if ! systemctl start "wg-quick@$DEVICE"; then
+      log "warning: systemctl start failed; falling back to a direct wg-quick up"
+      systemctl status "wg-quick@$DEVICE" --no-pager -n 8 >&2 || true
+      if ip link show "$DEVICE" >/dev/null 2>&1; then
+        log "interface already present; syncing instead"
+        wg syncconf "$DEVICE" <(wg-quick strip "$CONF")
+      else
+        wg-quick up "$DEVICE"
+      fi
+      log "warning: the interface is up but systemd did not start it;"
+      log "warning: run 'systemctl restart wg-quick@$DEVICE' after fixing the unit"
+    fi
   else
     log "starting interface: $DEVICE"
     wg-quick up "$DEVICE"
-  fi
-
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable "wg-quick@$DEVICE" >/dev/null 2>&1 || true
-    install_resilient_dropin "$DEVICE"
   fi
 
   printf '\n'
