@@ -405,19 +405,35 @@ add_client() {
     printf '%s\n' "$direct_ip" >>"$NAT_V4_FILE.seed"
   fi
 
-  # 2. Render the new config: same Interface lines and same [Peer] blocks, only
-  #    PostUp/PostDown replaced by the loop form.
+  # 2. Render the new config. The Interface section is rebuilt explicitly so
+  #    that SaveConfig and the PostUp/PostDown hooks stay INSIDE the section:
+  #    wg-quick only strips those keys when they follow [Interface], and passes
+  #    them through to wg otherwise, which aborts the sync.
+  local save_config
+  save_config="$(sed -n 's/^[[:space:]]*SaveConfig[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | tr -d '[:space:]')"
+  [ -n "$save_config" ] || save_config="false"
+
+  local iface_keys bad_keys
+  iface_keys="$(sed -n '/^[[:space:]]*\[Interface\]/,/^[[:space:]]*\[Peer\]/p' "$CONF" |
+    grep -E '=' |
+    grep -oE '^[[:space:]]*[A-Za-z]+[[:space:]]*=' |
+    tr -d '[:space:=' |
+    sort -u)"
+  bad_keys="$(printf '%s\n' "$iface_keys" | grep -vE '^(PrivateKey|Address|ListenPort|SaveConfig|PostUp|PostDown)$' || true)"
+  if [ -n "$bad_keys" ]; then
+    fail "$CONF has Interface keys this helper will not rebuild: $(printf '%s' "$bad_keys" | tr '\n' ' ')"
+  fi
+
   tmp="/tmp/$DEVICE.new.$$.conf"
   {
-    if grep -qE '^[[:space:]]*SaveConfig[[:space:]]*=' "$CONF"; then
-      sed -n '/^[[:space:]]*SaveConfig[[:space:]]*=/p' "$CONF"
-      render_hooks
-      grep -vE '^[[:space:]]*(SaveConfig|PostUp|PostDown)[[:space:]]*=' "$CONF"
-    else
-      sed -n '/^\[Interface\]/p' "$CONF"
-      render_hooks
-      grep -vE '^[[:space:]]*(PostUp|PostDown)[[:space:]]*=' "$CONF"
-    fi
+    printf '[Interface]\n'
+    sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/PrivateKey = /'
+    sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/Address = /'
+    sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/ListenPort = /'
+    printf 'SaveConfig = %s\n' "$save_config"
+    render_hooks
+    printf '\n'
+    sed -n '/^[[:space:]]*\[Peer\]/,$p' "$CONF"
     render_peer "$CLIENT_PUBLIC_KEY" "$primary_ip"
     if [ "$MODE" = "dual" ]; then
       render_peer "$WARP_CLIENT_PUBLIC_KEY" "$warp_ip"
@@ -427,8 +443,21 @@ add_client() {
   log "new config rendered: $tmp"
   sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
 
-  # 3. Validate before touching anything.
-  wg-quick strip "$tmp" >/dev/null || fail "rendered config failed wg-quick validation; nothing was changed"
+  # 3. Validate before touching anything. wg-quick exits 0 even when it leaks a
+  #    wg-quick-only directive, so inspect the stripped output explicitly.
+  local stripped
+  if ! stripped="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "rendered config failed wg-quick validation; nothing was changed"
+  fi
+  local leaked
+  leaked="$(printf '%s\n' "$stripped" |
+    grep -E '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*=' || true)"
+  if [ -n "$leaked" ]; then
+    fail "rendered config still leaks wg-quick-only directives: $(printf '%s' "$leaked" | tr '\n' ' '); nothing was changed"
+  fi
+  if ! printf '%s\n' "$stripped" | grep -q '^PrivateKey'; then
+    fail "rendered config lost the server PrivateKey; nothing was changed"
+  fi
 
   if [ "$DRY_RUN" = "true" ]; then
     log "dry-run: stopping before backup and apply"
@@ -624,7 +653,14 @@ remove_client() {
     fail "removal render dropped $((before - after)) peers but $expected was targeted; nothing was changed"
   fi
 
-  wg-quick strip "$tmp" >/dev/null || fail "removal render failed validation; nothing was changed"
+  local stripped_removed
+  if ! stripped_removed="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "removal render failed validation; nothing was changed"
+  fi
+  if printf '%s\n' "$stripped_removed" |
+    grep -qE '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*='; then
+    fail "removal render leaks wg-quick-only directives; nothing was changed"
+  fi
 
   if [ "$DRY_RUN" = "true" ]; then
     log "dry-run: would install:"
