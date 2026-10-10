@@ -14,6 +14,14 @@
 - Added `warp_forward.sh action=register`, which adds one more client to an already running forwarder without restarting it, falling back to a full startup when no forwarder is running. Manual `shared_node.sh action=add mode=warp` is now self-sufficient instead of requiring the Go deploy path to finish WARP wiring.
 - `shared_node.sh` can now fetch sibling helper scripts from the release URL when they are not next to the script itself.
 - Node uninstallers now also remove `/usr/local/bin/wpls`, `/usr/local/bin/warppool-node-client` and `/etc/warppool-node/legacy-clients`.
+- Added `wpls init`, which sets up an exit node with no main server at all: it generates the server keypair, writes the config, starts and enables the interface, and installs a systemd drop-in that retries a failed boot start. Backed by `legacy_add_client.sh action=init`.
+- The installers now place the runtime helpers (`warp_forward.sh`, `warp_install.sh`, `warp_wgcf.sh`, `singbox_install.sh`, `wg_preflight.sh`) in `/usr/local/lib/warppool/node/`, so nothing has to be fetched at run time and a node can never pull a helper that does not match its installed manager.
+- Fixed `wpls list edit` renaming a connection: it moved the record file but left the `NAME` field inside it, so every later edit failed with "record not found".
+- Fixed `warp`-only mode exporting a client config built from `warp_client_private_key` (which backs the second peer in `dual` mode) instead of the `client_private_key` matching its peer, producing a config that could never connect.
+- No client config is written when no `endpoint` was supplied: the main-server add flow does not ask for one, and the resulting file could not dial anything.
+- Fixed adding a client to a config that has no peers yet (`wpls init` produces exactly that) aborting under `set -o pipefail`.
+- Fixed `wpls init` not handing the interface to systemd, which made a later `systemctl restart` fail and, with the resilient drop-in, retry forever.
+- `wpls list` now uses ASCII type markers (`wpl` / `wg` / `-`); the Chinese label was 6 display columns but 9 bytes, shifting every column after it.
 
 ## v0.1.12
 

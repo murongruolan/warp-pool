@@ -14,6 +14,14 @@
 - 新增 `warp_forward.sh action=register`，在转发器已经运行时直接追加客户端而不重启；没有转发器运行时回退到完整启动流程。手动执行 `shared_node.sh action=add mode=warp` 现在自成一体，不再依赖 Go 部署流程补 WARP 接线。
 - `shared_node.sh` 在同目录缺少配套脚本时，可以从发布地址自动下载。
 - 节点卸载脚本现在会一并清理 `/usr/local/bin/wpls`、`/usr/local/bin/warppool-node-client` 与 `/etc/warppool-node/legacy-clients`。
+- 新增 `wpls init`：在没有主服务器的情况下初始化出口节点（生成服务端密钥、写配置、启动接口、装开机自愈）。配套的 `legacy_add_client.sh action=init` 让"不配置主服务器、只当出口用"成为可行路径。
+- 安装脚本会把运行期需要的 helper（`warp_forward.sh`、`warp_install.sh`、`warp_wgcf.sh`、`singbox_install.sh`、`wg_preflight.sh`）装到 `/usr/local/lib/warppool/node/`，运行期不再需要联网下载，避免出现"节点版本与拉取的 helper 版本不匹配"。
+- 修复 `wpls list edit` 改名只移动文件、未同步记录内的 `NAME` 字段，导致改名之后所有后续编辑都报"找不到登记文件"。
+- 修复 `warp` 单隧道模式导出的客户端配置使用了 `warp_client_private_key`（那是 dual 模式第二条隧道用的），与 peer 的 `client_public_key` 不是一对密钥，客户端无法连接。
+- 未提供 `endpoint` 时不再生成客户端配置（添加主服务器时那份配置本就无法拨号，是个空壳）。
+- 修复配置中还没有任何 peer 时（`wpls init` 刚建好）添加客户端会因 `set -o pipefail` 中断。
+- 修复 `wpls init` 未把接口交给 systemd 管理，导致之后 `systemctl restart` 必然失败并因自愈策略无限重试。
+- `wpls list` 的类型列改用 ASCII 标记（`wpl` / `wg` / `-`），修正中文因字节数与显示宽度不一致造成的列错位。
 
 ## v0.1.12
 

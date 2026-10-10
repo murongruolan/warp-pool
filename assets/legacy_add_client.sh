@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r20"
+SCRIPT_VERSION="2026.10.10-r21"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -624,11 +624,14 @@ add_client() {
     register_warp_client "$warp_ip"
   fi
 
-  # 7. Client configs.
-  mkdir -p "$CONFIG_DIR"
-  chmod 0700 "$CONFIG_DIR"
+  # 7. Client configs. Skipped when no endpoint was supplied: without one the
+  #    config cannot dial anything, and the main-server add flow deliberately
+  #    does not ask for it (that peer keeps its own config).
   CLIENT_DIRECT_FILE=""
   CLIENT_WARP_FILE=""
+  if [ -n "$ENDPOINT" ]; then
+  mkdir -p "$CONFIG_DIR"
+  chmod 0700 "$CONFIG_DIR"
   local direct_file="" warp_file=""
   case "$MODE" in
     dual)
@@ -658,6 +661,7 @@ add_client() {
     render_client_config "$warp_ip" "$warp_priv" >"$warp_file"
     chmod 0600 "$warp_file"
     CLIENT_WARP_FILE="$warp_file"
+  fi
   fi
 
   cat >"$CLIENT_STATE_DIR/$NAME.env" <<EOF

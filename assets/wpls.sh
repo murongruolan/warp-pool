@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_VERSION="2026.10.11-r6"
+WPLS_VERSION="2026.10.11-r7"
 
 # wpls - WarpPool exit-node connection manager.
 #
@@ -324,10 +324,12 @@ guess_public_ip() {
 }
 
 kind_label() {
+  # ASCII only: printf pads by bytes, and a Chinese label (6 display columns but
+  # 9 bytes) would push every following column out of line.
   case "$1" in
     wpl) printf 'wpl' ;;
     wg) printf 'wg' ;;
-    *) printf '未登记' ;;
+    *) printf '-' ;;
   esac
 }
 
@@ -374,7 +376,7 @@ build_view() {
       fi
       idx=$((idx + 1))
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tno\t%s\n' \
-        "$idx" "<未登记>" "未登记" "$(port_of "$d" "" "")" \
+        "$idx" "<unreg>" "-" "$(port_of "$d" "" "")" \
         "${addr%%/*}" "$(status_of "$d" "$key")" "$key" "$d" >>"$VIEW_FILE"
       printf '%s\n' "$key" >>"$KEYS_FILE"
     done < <(wg show "$d" allowed-ips 2>/dev/null || true)
@@ -385,17 +387,16 @@ build_view() {
 
 print_view() {
   hr
-  # Chinese labels are double width but triple bytes, so the header is spelled
-  # out with explicit spaces rather than relying on printf padding.
-  printf '%s\n' "序号  名称           类型        端口    地址             状态"
+  # Columns 1-5 hold ASCII only, so byte padding equals display padding. The
+  # Chinese header is spelled out with explicit spaces to match those widths.
+  printf '%s\n' "序号  名称             类型  端口    地址             状态"
   hr
   if [ "${VIEW_COUNT:-0}" -eq 0 ]; then
     printf '%s\n' "  （还没有任何连接）"
     hr
     return 0
   fi
-  # The type column is padded to 10 so the 9-byte label 未登记 lines up with wg/wpl.
-  awk -F'\t' '{ printf "%-4s  %-13s  %-10s  %-6s  %-15s  %s\n", $1, $2, $3, $4, $5, $6 }' "$VIEW_FILE"
+  awk -F'\t' '{ printf "%-4s  %-14s  %-5s  %-6s  %-15s  %s\n", $1, $2, $3, $4, $5, $6 }' "$VIEW_FILE"
   hr
 }
 
@@ -862,15 +863,31 @@ cmd_edit() {
   confirm "确认修改" || { info "已取消，未做任何改动。"; return 0; }
 
   if [ "$choice" = "name" ]; then
-    [ -e "$(record_path "$rdev" "$newvalue")" ] && fail "名称已存在: $newvalue"
-    mv "$rpath" "$(record_path "$rdev" "$newvalue")"
-    local suffix f
+    local sname newpath tmp suffix f
+    sname="$(printf '%s' "$newvalue" | sed 's/[^A-Za-z0-9._-]/-/g; s/^[-.]*//; s/[-.]*$//')"
+    [ -n "$sname" ] || fail "新名称无效：只能使用字母、数字、点、下划线和连字符"
+    if [ "$sname" = "$name" ]; then
+      info "名称未变化，未做任何改动。"
+      return 0
+    fi
+    [ -e "$(record_path "$rdev" "$sname")" ] && fail "名称已存在: $sname"
+
+    newpath="$(record_path "$rdev" "$sname")"
+    mv "$rpath" "$newpath"
+    # The record file name and the NAME field inside it must stay in step:
+    # build_view reads NAME, then record_path is derived from it, so a rename
+    # that only moves the file makes every later edit look up a missing file.
+    tmp="$newpath.tmp.$$"
+    sed "s|^NAME=.*|NAME='$sname'|" "$newpath" >"$tmp"
+    chmod 0600 "$tmp"
+    mv "$tmp" "$newpath"
+
     for suffix in ".conf" "-direct.conf" "-warp.conf"; do
       f="$CONFIG_DIR/$name$suffix"
-      [ -e "$f" ] && mv "$f" "$CONFIG_DIR/$newvalue$suffix"
+      [ -e "$f" ] && mv "$f" "$CONFIG_DIR/$sname$suffix"
     done
     info ""
-    info "已把连接重命名为：$newvalue"
+    info "已把连接重命名为：$sname"
     info "客户端本地配置无需改动，名称只是本节点上的标记。"
     return 0
   fi
