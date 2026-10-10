@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r9"
+SCRIPT_VERSION="2026.10.10-r10"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -612,16 +612,26 @@ list_clients() {
     found=1
     NAME=""
     MODE=""
+    CLIENT_PUBLIC_KEY=""
+    CLIENT_PRIVATE_KEY=""
     CLIENT_IPV4=""
+    WARP_CLIENT_PUBLIC_KEY=""
     WARP_CLIENT_IPV4=""
     CREATED_AT=""
+    ROTATED_AT=""
     # shellcheck disable=SC1090
     . "$f"
     printf '\n  name     : %s\n' "$NAME"
     printf '    mode     : %s\n' "$MODE"
     printf '    created  : %s\n' "$CREATED_AT"
+    if [ -n "${ROTATED_AT:-}" ]; then
+      printf '    rotated  : %s\n' "$ROTATED_AT"
+    fi
     printf '    direct   : %s\n' "${CLIENT_IPV4:-none}"
+    printf '      key    : %s\n' "${CLIENT_PUBLIC_KEY:-none}"
+    printf '      priv   : %s\n' "$([ -n "${CLIENT_PRIVATE_KEY:-}" ] && echo '<held on this node>' || echo '<not on this node>')"
     printf '    warp     : %s\n' "${WARP_CLIENT_IPV4:-none}"
+    printf '      key    : %s\n' "${WARP_CLIENT_PUBLIC_KEY:-none}"
   done
   if [ "$found" -eq 0 ]; then
     printf '\n  (none)\n'
