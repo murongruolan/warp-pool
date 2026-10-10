@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r17"
+SCRIPT_VERSION="2026.10.10-r18"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -10,6 +10,8 @@ SCRIPT_VERSION="2026.10.10-r17"
 
 ACTION="add"
 DEVICE=""
+LISTEN_PORT=""
+SERVER_ADDR=""
 MODE="dual"
 NAME=""
 CLIENT_PUBLIC_KEY=""
@@ -131,6 +133,8 @@ parse_args() {
         ;;
       action=*) ACTION="${arg#action=}" ;;
       device=*) DEVICE="${arg#device=}" ;;
+      listen_port=*) LISTEN_PORT="${arg#listen_port=}" ;;
+      server_addr=*) SERVER_ADDR="${arg#server_addr=}" ;;
       mode=*) MODE="${arg#mode=}"; MODE_SET="true" ;;
       name=*) NAME="${arg#name=}" ;;
       client_public_key=*) CLIENT_PUBLIC_KEY="${arg#client_public_key=}" ;;
