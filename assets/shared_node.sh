@@ -16,6 +16,25 @@ STATE_DIR="/etc/warppool-node/shared"
 DRY_RUN="false"
 REQUESTED_SERVER_IPV6_ADDR=""
 
+# Extra non-main-server client support (action=add-client / list / remove)
+BASE_URL="${WARPPOOL_INSTALL_BASE_URL:-${WARPOOL_INSTALL_BASE_URL:-https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets}}"
+DOWNLOAD_DIR="/tmp/warppool-shared.$$"
+CLIENT_NAME=""
+CLIENT_PRIVATE_KEY=""
+WARP_CLIENT_PRIVATE_KEY=""
+PEER_NAME=""
+ENDPOINT=""
+CLIENT_ALLOWED_IPS="0.0.0.0/0, ::/0"
+CLIENT_DNS="1.1.1.1, 8.8.8.8"
+CLIENT_CONFIG_DIR=""
+TRANSPARENT_PORT="14000"
+REMOVE_TARGET=""
+PRINT_CONFIG="true"
+REGISTER_WARP="true"
+ALLOW_LEGACY="false"
+CLIENT_DIRECT_FILE=""
+CLIENT_WARP_FILE=""
+
 log() {
   printf '[WarpPool][shared-node] %s\n' "$*"
 }
@@ -32,6 +51,17 @@ on_error() {
   exit "$status"
 }
 
+cleanup_download_dir() {
+  if [ -n "${DOWNLOAD_DIR:-}" ] && [ -d "$DOWNLOAD_DIR" ]; then
+    rm -rf -- "$DOWNLOAD_DIR"
+  fi
+}
+
+on_exit() {
+  release_lock
+  cleanup_download_dir
+}
+
 trap 'on_error $LINENO' ERR
 
 usage() {
@@ -41,8 +71,27 @@ WarpPool shared node helper
 Usage:
   bash shared_node.sh action=add mode=direct|warp|dual client_public_key=<key> [warp_client_public_key=<key>] [device=wpshared] [listen_port=51820] [server_addr=10.200.0.1/24] [server_ipv6_addr=fd7a:7761:7270::1/64] [enable_ipv6=true|false] [egress=<iface>] [skip_up=true|false]
 
+  bash shared_node.sh action=add-client mode=direct|warp|dual name=<label> \
+      [client_public_key=<key>] [client_private_key=<key>] \
+      [warp_client_public_key=<key>] [warp_client_private_key=<key>] \
+      [endpoint=<public-host:port>] [allowed_ips=0.0.0.0/0,::/0] [dns=1.1.1.1,8.8.8.8] \
+      [config_dir=/root/warppool-clients] [transparent_port=14000] [register_warp=true|false]
+
+  bash shared_node.sh action=list
+  bash shared_node.sh action=remove target=<label|public-key>
+
 This script keeps one shared WireGuard server on an exit node and appends
 additional main-server peers without overwriting existing peers.
+
+action=add-client is for non-main-server clients (a local PC, a phone, a
+second admin box). It registers the peer, wires up WARP forwarding for
+warp/dual mode, and renders a ready-to-import WireGuard client config with a
+full-tunnel AllowedIPs list.
+
+Set allow_legacy=true to bootstrap a shared node on a host that still has an
+old /etc/wireguard/wp<name>.conf. The legacy config is left running, so use a
+different listen_port for the shared device. This is for planned side-by-side
+migrations only.
 USAGE
 }
 
@@ -68,6 +117,19 @@ parse_args() {
       egress=*) EGRESS_INTERFACE="${arg#egress=}" ;;
       skip_up=*) SKIP_UP="${arg#skip_up=}" ;;
       state_dir=*) STATE_DIR="${arg#state_dir=}" ;;
+      name=*|client_name=*) CLIENT_NAME="${arg#*=}" ;;
+      client_private_key=*) CLIENT_PRIVATE_KEY="${arg#client_private_key=}" ;;
+      warp_client_private_key=*) WARP_CLIENT_PRIVATE_KEY="${arg#warp_client_private_key=}" ;;
+      endpoint=*) ENDPOINT="${arg#endpoint=}" ;;
+      allowed_ips=*|client_allowed_ips=*) CLIENT_ALLOWED_IPS="${arg#*=}" ;;
+      dns=*|client_dns=*) CLIENT_DNS="${arg#*=}" ;;
+      config_dir=*|client_config_dir=*) CLIENT_CONFIG_DIR="${arg#*=}" ;;
+      transparent_port=*) TRANSPARENT_PORT="${arg#transparent_port=}" ;;
+      print_config=*) PRINT_CONFIG="${arg#*=}" ;;
+      register_warp=*) REGISTER_WARP="${arg#*=}" ;;
+      allow_legacy=*) ALLOW_LEGACY="${arg#*=}" ;;
+      target=*|remove=*) REMOVE_TARGET="${arg#*=}" ;;
+      base_url=*) BASE_URL="${arg#base_url=}" ;;
       *) fail "unknown argument: $arg" ;;
     esac
   done
@@ -108,8 +170,8 @@ validate_bool() {
 
 validate_args() {
   case "$ACTION" in
-    add|status) ;;
-    *) fail "unsupported action: $ACTION, expected add or status" ;;
+    add|add-client|status|list|remove) ;;
+    *) fail "unsupported action: $ACTION, expected add, add-client, status, list, or remove" ;;
   esac
   case "$MODE" in
     direct|warp|dual) ;;
@@ -128,11 +190,28 @@ validate_args() {
   fi
   validate_bool enable_ipv6 "$ENABLE_IPV6"
   validate_bool skip_up "$SKIP_UP"
-  if [ "$ACTION" = "add" ]; then
-    [ -n "$CLIENT_PUBLIC_KEY" ] || fail "client_public_key is required"
-    if [ "$MODE" = "dual" ]; then
-      [ -n "$WARP_CLIENT_PUBLIC_KEY" ] || fail "warp_client_public_key is required in dual mode"
+  validate_bool print_config "$PRINT_CONFIG"
+  validate_bool register_warp "$REGISTER_WARP"
+  validate_bool allow_legacy "$ALLOW_LEGACY"
+  case "$TRANSPARENT_PORT" in
+    ""|*[!0-9]*) fail "invalid transparent_port: $TRANSPARENT_PORT" ;;
+  esac
+  if [ "$ACTION" = "add" ] || [ "$ACTION" = "add-client" ]; then
+    if [ -z "$CLIENT_PUBLIC_KEY" ] && [ -z "$CLIENT_PRIVATE_KEY" ]; then
+      if [ "$ACTION" = "add" ]; then
+        fail "client_public_key is required"
+      fi
+      log "no client keypair supplied; this node will generate one"
     fi
+    if [ "$MODE" = "dual" ] && [ -z "$WARP_CLIENT_PUBLIC_KEY" ] && [ -z "$WARP_CLIENT_PRIVATE_KEY" ]; then
+      if [ "$ACTION" = "add" ]; then
+        fail "warp_client_public_key is required in dual mode"
+      fi
+      log "no WARP client keypair supplied; this node will generate one"
+    fi
+  fi
+  if [ "$ACTION" = "remove" ]; then
+    [ -n "$REMOVE_TARGET" ] || fail "remove requires target=<label|public-key>"
   fi
 }
 
@@ -157,12 +236,75 @@ acquire_lock() {
   mkdir -p "$(dirname "$STATE_DIR")"
   for attempt in $(seq 1 30); do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      trap release_lock EXIT
+      trap on_exit EXIT
       return 0
     fi
     sleep 1
   done
   fail "shared node state is locked by another deployment: $LOCK_DIR"
+}
+
+script_dir() {
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd
+}
+
+download_script() {
+  local name="$1"
+  local target="$2"
+  require_command curl
+  log "downloading $name from $BASE_URL" >&2
+  curl -fsSL "$BASE_URL/$name" -o "$target" || fail "failed to download $name from $BASE_URL"
+  chmod 0755 "$target"
+}
+
+helper_path() {
+  local name="$1"
+  local dir local_path
+  dir="$(script_dir)"
+  local_path="$dir/$name"
+  if [ -r "$local_path" ]; then
+    printf '%s\n' "$local_path"
+    return 0
+  fi
+  mkdir -p "$DOWNLOAD_DIR"
+  download_script "$name" "$DOWNLOAD_DIR/$name"
+  printf '%s\n' "$DOWNLOAD_DIR/$name"
+}
+
+sanitize_name() {
+  printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/-/g; s/^[-.]*//; s/[-.]*$//' | cut -c1-32
+}
+
+is_public_key() {
+  case "$1" in
+    ""|*[!A-Za-z0-9+/=]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 44 ] && [ "${1: -1}" = "=" ]
+}
+
+format_endpoint_host() {
+  local value="$1"
+  value="${value#[}"
+  value="${value%]}"
+  case "$value" in
+    *:*)
+      printf '[%s]\n' "$value"
+      return 0
+      ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+detect_public_endpoint() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if [ -z "$ip" ] && command -v wget >/dev/null 2>&1; then
+    ip="$(wget -qO- -T 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  [ -n "$ip" ] || return 1
+  printf '%s:%s\n' "$(format_endpoint_host "$ip")" "$LISTEN_PORT"
 }
 
 load_state() {
@@ -215,7 +357,11 @@ init_state() {
     [ -e "$legacy" ] || continue
     legacy_name="$(basename "$legacy" .conf)"
     [ "$legacy_name" = "$DEVICE" ] && continue
-    fail "existing legacy WarpPool WireGuard config detected: $legacy. Shared mode will not convert it automatically; remove it with warppool-node-uninstall or use a clean node."
+    if [ "$ALLOW_LEGACY" = "true" ]; then
+      log "warning: legacy config left untouched: $legacy (allow_legacy=true)"
+      continue
+    fi
+    fail "existing legacy WarpPool WireGuard config detected: $legacy. Shared mode will not convert it automatically; remove it with warppool-node-uninstall or use a clean node. Note: when $STATE_FILE already exists this check is skipped."
   done
 
   require_command wg
@@ -316,10 +462,13 @@ write_peer() {
   write_state
   cat >"$path" <<EOF
 MODE=$(quote_env "$MODE")
+NAME=$(quote_env "$PEER_NAME")
 CLIENT_PUBLIC_KEY=$(quote_env "$CLIENT_PUBLIC_KEY")
+CLIENT_PRIVATE_KEY=$(quote_env "$CLIENT_PRIVATE_KEY")
 CLIENT_IPV4=$(quote_env "$CLIENT_IPV4")
 CLIENT_IPV6=$(quote_env "$CLIENT_IPV6")
 WARP_CLIENT_PUBLIC_KEY=$(quote_env "$WARP_CLIENT_PUBLIC_KEY")
+WARP_CLIENT_PRIVATE_KEY=$(quote_env "$WARP_CLIENT_PRIVATE_KEY")
 WARP_CLIENT_IPV4=$(quote_env "$WARP_CLIENT_IPV4")
 WARP_CLIENT_IPV6=$(quote_env "$WARP_CLIENT_IPV6")
 CREATED_AT=$(quote_env "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
@@ -407,11 +556,14 @@ render_config() {
     fi
     for peer in "$PEER_DIR"/*.env; do
       [ -e "$peer" ] || continue
+      NAME=""
       MODE=""
       CLIENT_PUBLIC_KEY=""
+      CLIENT_PRIVATE_KEY=""
       CLIENT_IPV4=""
       CLIENT_IPV6=""
       WARP_CLIENT_PUBLIC_KEY=""
+      WARP_CLIENT_PRIVATE_KEY=""
       WARP_CLIENT_IPV4=""
       WARP_CLIENT_IPV6=""
       # shellcheck disable=SC1090
@@ -562,6 +714,289 @@ WARPPOOL_SHARED_END
 EOF
 }
 
+# --- non-main-server client support ---
+
+prepare_client() {
+  PEER_NAME="$(sanitize_name "${CLIENT_NAME:-}")"
+  if [ -z "$CLIENT_NAME" ]; then
+    PEER_NAME="client-$(date +%s)"
+  fi
+  if [ -z "$PEER_NAME" ]; then
+    fail "name is invalid; pass name=<label> using letters, digits, dot, dash or underscore"
+  fi
+  # Read existing names in a subshell: sourcing peer files would otherwise
+  # overwrite MODE / *_PUBLIC_KEY / *_PRIVATE_KEY for the peer we are adding.
+  local existing
+  existing="$(
+    for f in "$PEER_DIR"/*.env; do
+      [ -e "$f" ] || continue
+      NAME=""
+      # shellcheck disable=SC1090
+      . "$f"
+      printf '%s\n' "$NAME"
+    done
+  )"
+  if printf '%s\n' "$existing" | grep -Fxq "$PEER_NAME"; then
+    fail "client name already in use: $PEER_NAME (remove it first with action=remove target=$PEER_NAME, or choose another name)"
+  fi
+}
+
+ensure_client_keypair() {
+  if [ -n "$CLIENT_PUBLIC_KEY" ]; then
+    is_public_key "$CLIENT_PUBLIC_KEY" || fail "client_public_key does not look like a WireGuard public key"
+  fi
+  if [ -z "$CLIENT_PRIVATE_KEY" ]; then
+    require_command wg
+    CLIENT_PRIVATE_KEY="$(wg genkey)"
+  fi
+  if [ -z "$CLIENT_PUBLIC_KEY" ]; then
+    CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
+  fi
+  if [ "$MODE" = "dual" ]; then
+    if [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+      is_public_key "$WARP_CLIENT_PUBLIC_KEY" || fail "warp_client_public_key does not look like a WireGuard public key"
+    fi
+    if [ -z "$WARP_CLIENT_PRIVATE_KEY" ]; then
+      require_command wg
+      WARP_CLIENT_PRIVATE_KEY="$(wg genkey)"
+    fi
+    if [ -z "$WARP_CLIENT_PUBLIC_KEY" ]; then
+      WARP_CLIENT_PUBLIC_KEY="$(printf '%s' "$WARP_CLIENT_PRIVATE_KEY" | wg pubkey)"
+    fi
+  fi
+}
+
+ensure_endpoint() {
+  if [ -n "$ENDPOINT" ]; then
+    return 0
+  fi
+  if ENDPOINT="$(detect_public_endpoint)"; then
+    log "auto-detected public endpoint: $ENDPOINT"
+    log "on a NAT VPS this is often wrong; re-run with endpoint=<public-host:port> if the client cannot connect"
+    return 0
+  fi
+  fail "cannot detect the public endpoint; pass endpoint=<public-host:port>"
+}
+
+register_warp_clients() {
+  if [ "$REGISTER_WARP" != "true" ]; then
+    log "register_warp=false: skipping WARP forwarding registration"
+    return 0
+  fi
+  case "$MODE" in
+    warp)
+      register_warp_client "${RESPONSE_CLIENT_IPV4%%/*}"
+      ;;
+    dual)
+      register_warp_client "${RESPONSE_WARP_CLIENT_IPV4%%/*}"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+register_warp_client() {
+  local ip="$1"
+  local forwarder
+  [ -n "$ip" ] || return 0
+  forwarder="$(helper_path warp_forward.sh)"
+  log "registering WARP forwarding client $ip on $DEVICE"
+  run bash "$forwarder" action=register \
+    device="$DEVICE" client_addr="$ip" \
+    server_addr="$SERVER_ADDR" transparent_port="$TRANSPARENT_PORT"
+}
+
+unregister_warp_client() {
+  local ip="$1"
+  local forwarder
+  [ -n "$ip" ] || return 0
+  forwarder="$(helper_path warp_forward.sh)"
+  log "unregistering WARP forwarding client $ip on $DEVICE"
+  run bash "$forwarder" action=down \
+    device="$DEVICE" client_addr="$ip" \
+    server_addr="$SERVER_ADDR" transparent_port="$TRANSPARENT_PORT"
+}
+
+render_client_tunnel() {
+  local private_key="$1" ipv4="$2" ipv6="$3"
+  local address="$ipv4"
+  if [ -n "$ipv6" ] && [ -n "$SERVER_IPV6_ADDR" ]; then
+    address="$address, $ipv6"
+  fi
+  cat <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = $address
+DNS = $CLIENT_DNS
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = $ENDPOINT
+AllowedIPs = $CLIENT_ALLOWED_IPS
+PersistentKeepalive = 25
+EOF
+}
+
+write_client_config() {
+  CLIENT_DIRECT_FILE=""
+  CLIENT_WARP_FILE=""
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: skip writing client configs"
+    return 0
+  fi
+  local dir="$CLIENT_CONFIG_DIR"
+  if [ -z "$dir" ]; then
+    dir="/root/warppool-clients"
+  fi
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  CLIENT_DIRECT_FILE="$dir/$PEER_NAME.conf"
+  render_client_tunnel "$CLIENT_PRIVATE_KEY" "$RESPONSE_CLIENT_IPV4" "$RESPONSE_CLIENT_IPV6" >"$CLIENT_DIRECT_FILE"
+  chmod 0600 "$CLIENT_DIRECT_FILE"
+  if [ "$MODE" = "dual" ]; then
+    CLIENT_WARP_FILE="$dir/$PEER_NAME-warp.conf"
+    render_client_tunnel "$WARP_CLIENT_PRIVATE_KEY" "$RESPONSE_WARP_CLIENT_IPV4" "$RESPONSE_WARP_CLIENT_IPV6" >"$CLIENT_WARP_FILE"
+    chmod 0600 "$CLIENT_WARP_FILE"
+  fi
+}
+
+print_client_summary() {
+  printf '\n'
+  printf 'WarpPool client tunnel configured\n'
+  printf '  name        : %s\n' "$PEER_NAME"
+  printf '  mode        : %s\n' "$MODE"
+  printf '  device      : %s\n' "$DEVICE"
+  printf '  endpoint    : %s\n' "$ENDPOINT"
+  printf '  server addr : %s\n' "$SERVER_ADDR"
+  if [ "$MODE" = "dual" ]; then
+    printf '  direct addr : %s\n' "$RESPONSE_CLIENT_IPV4"
+    printf '  warp addr   : %s\n' "$RESPONSE_WARP_CLIENT_IPV4"
+  else
+    printf '  tunnel addr : %s\n' "$RESPONSE_CLIENT_IPV4"
+  fi
+  printf '  config file : %s\n' "${CLIENT_DIRECT_FILE:-<not written>}"
+  if [ -n "$CLIENT_WARP_FILE" ]; then
+    printf '  warp config : %s\n' "$CLIENT_WARP_FILE"
+  fi
+  case "$MODE" in
+    warp|dual)
+      printf '\n'
+      printf 'NOTE: WARP forwarding only redirects TCP. UDP from this tunnel is dropped.\n'
+      printf '      Use the direct config for UDP, or deploy mode=dual for both.\n'
+      ;;
+  esac
+  if [ "$PRINT_CONFIG" = "true" ]; then
+    if [ -n "$CLIENT_DIRECT_FILE" ] && [ -r "$CLIENT_DIRECT_FILE" ]; then
+      printf '\n----- BEGIN WireGuard config: %s -----\n' "$PEER_NAME"
+      cat "$CLIENT_DIRECT_FILE"
+      printf -- '----- END WireGuard config: %s -----\n' "$PEER_NAME"
+    fi
+    if [ -n "$CLIENT_WARP_FILE" ] && [ -r "$CLIENT_WARP_FILE" ]; then
+      printf '\n----- BEGIN WireGuard config: %s (WARP exit) -----\n' "$PEER_NAME"
+      cat "$CLIENT_WARP_FILE"
+      printf -- '----- END WireGuard config: %s (WARP exit) -----\n' "$PEER_NAME"
+    fi
+  fi
+}
+
+list_peers() {
+  if ! load_state; then
+    fail "shared state not found: $STATE_FILE"
+  fi
+  printf 'device=%s listen_port=%s server_addr=%s ipv6=%s\n' \
+    "$DEVICE" "$LISTEN_PORT" "$SERVER_ADDR" "${SERVER_IPV6_ADDR:-<none>}"
+  local found=0 f
+  for f in "$PEER_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    found=1
+    NAME=""
+    MODE=""
+    CLIENT_PUBLIC_KEY=""
+    CLIENT_IPV4=""
+    WARP_CLIENT_PUBLIC_KEY=""
+    WARP_CLIENT_IPV4=""
+    CREATED_AT=""
+    # shellcheck disable=SC1090
+    . "$f"
+    printf '\npeer file    : %s\n' "$(basename "$f")"
+    printf '  name       : %s\n' "${NAME:-<unnamed main-server peer>}"
+    printf '  mode       : %s\n' "$MODE"
+    printf '  created    : %s\n' "$CREATED_AT"
+    printf '  direct key : %s\n' "$CLIENT_PUBLIC_KEY"
+    printf '  direct addr: %s\n' "$CLIENT_IPV4"
+    if [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+      printf '  warp key   : %s\n' "$WARP_CLIENT_PUBLIC_KEY"
+      printf '  warp addr  : %s\n' "$WARP_CLIENT_IPV4"
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    printf '\nno peers registered yet\n'
+  fi
+}
+
+purge_nat_rules() {
+  local ip="$1"
+  [ -n "$ip" ] || return 0
+  [ -n "$EGRESS_INTERFACE" ] || return 0
+  require_command iptables
+  while iptables -t nat -C POSTROUTING -s "${ip%%/*}/32" -o "$EGRESS_INTERFACE" -j MASQUERADE >/dev/null 2>&1; do
+    run iptables -t nat -D POSTROUTING -s "${ip%%/*}/32" -o "$EGRESS_INTERFACE" -j MASQUERADE
+  done
+  if [ -n "$SERVER_IPV6_ADDR" ] && command -v ip6tables >/dev/null 2>&1; then
+    while ip6tables -t nat -C POSTROUTING -s "${ip%%/*}/128" -o "$EGRESS_INTERFACE" -j MASQUERADE >/dev/null 2>&1; do
+      run ip6tables -t nat -D POSTROUTING -s "${ip%%/*}/128" -o "$EGRESS_INTERFACE" -j MASQUERADE
+    done
+  fi
+  return 0
+}
+
+remove_peer() {
+  if ! load_state; then
+    fail "shared state not found: $STATE_FILE"
+  fi
+  local f match="" name="" mode="" client_ip="" warp_ip=""
+  for f in "$PEER_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    NAME=""
+    MODE=""
+    CLIENT_PUBLIC_KEY=""
+    CLIENT_IPV4=""
+    WARP_CLIENT_PUBLIC_KEY=""
+    WARP_CLIENT_IPV4=""
+    # shellcheck disable=SC1090
+    . "$f"
+    if [ "$NAME" = "$REMOVE_TARGET" ] || [ "$CLIENT_PUBLIC_KEY" = "$REMOVE_TARGET" ] || [ "$WARP_CLIENT_PUBLIC_KEY" = "$REMOVE_TARGET" ]; then
+      match="$f"
+      name="$NAME"
+      mode="$MODE"
+      client_ip="$CLIENT_IPV4"
+      warp_ip="$WARP_CLIENT_IPV4"
+      break
+    fi
+  done
+  [ -n "$match" ] || fail "no peer matched target: $REMOVE_TARGET"
+
+  log "removing peer ${name:-<unnamed>} ($(basename "$match"))"
+  run rm -f "$match"
+  render_config
+  apply_config
+  purge_nat_rules "$client_ip"
+  purge_nat_rules "$warp_ip"
+
+  if [ "$REGISTER_WARP" = "true" ]; then
+    case "$mode" in
+      warp)
+        unregister_warp_client "${client_ip%%/*}"
+        ;;
+      dual)
+        unregister_warp_client "${warp_ip%%/*}"
+        ;;
+    esac
+  fi
+  log "peer removed; other peers keep their tunnels"
+}
+
 status() {
   if ! load_state; then
     fail "shared state not found: $STATE_FILE"
@@ -582,6 +1017,13 @@ main() {
     status)
       status
       ;;
+    list)
+      list_peers
+      ;;
+    remove)
+      acquire_lock
+      remove_peer
+      ;;
     add)
       acquire_lock
       init_state
@@ -589,6 +1031,19 @@ main() {
       render_config
       apply_config
       print_response
+      ;;
+    add-client)
+      acquire_lock
+      init_state
+      prepare_client
+      ensure_client_keypair
+      ensure_endpoint
+      write_peer
+      render_config
+      apply_config
+      write_client_config
+      register_warp_clients
+      print_client_summary
       ;;
   esac
 }

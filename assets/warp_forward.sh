@@ -45,12 +45,15 @@ usage() {
 WarpPool WARP forwarding helper
 
 Usage:
-  bash warp_forward.sh action=up|down|status|probe device=<wg-device> client_addr=<client-cidr> [server_addr=<server-cidr>] [transparent_port=14000] [tcp_mss=1000] [backend=auto|socks|wireguard] [--dry-run]
+  bash warp_forward.sh action=up|down|register|status|probe device=<wg-device> client_addr=<client-cidr> [server_addr=<server-cidr>] [transparent_port=14000] [tcp_mss=1000] [backend=auto|socks|wireguard] [--dry-run]
 
 This script redirects TCP traffic entering the WireGuard device to a local
 sing-box redirect inbound, then sends it to Cloudflare WARP. The default
 backend first tries the official WARP local SOCKS proxy, then falls back to
 wgcf + sing-box embedded WireGuard endpoint.
+
+action=register adds one more client to an already running forwarder without
+restarting it. Use it when a new peer joins a shared node that already has WARP.
 USAGE
 }
 
@@ -120,8 +123,8 @@ validate_bool() {
 
 validate_args() {
   case "$ACTION" in
-    up|down|status|probe) ;;
-    *) fail "unsupported action: $ACTION, expected up, down, status, or probe" ;;
+    up|down|register|status|probe) ;;
+    *) fail "unsupported action: $ACTION, expected up, down, register, status, or probe" ;;
   esac
 
   case "$DEVICE" in
@@ -884,6 +887,47 @@ clients_remaining() {
   grep -Eq '[^[:space:]]' "$CLIENTS_PATH"
 }
 
+forwarder_active() {
+  if systemd_available; then
+    if systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  fi
+  if openrc_available; then
+    if rc-service "$OPENRC_NAME" status >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  fi
+  if [ -r "$PID_PATH" ]; then
+    local pid
+    pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+register_client_only() {
+  register_client
+  if forwarder_active; then
+    log "forwarder already running for $DEVICE; registering client without restart"
+    add_iptables_rules
+    status
+    log "WARP forwarding client added for $DEVICE"
+    return 0
+  fi
+  log "forwarder is not running for $DEVICE; performing full startup"
+  select_warp_backend
+  write_singbox_config
+  start_singbox
+  add_iptables_rules
+  status
+  log "WARP forwarding enabled for $DEVICE"
+}
+
 start_singbox() {
   local exec_start command_path command_args add_client_rules delete_client_rules add_mss_rules delete_mss_rules
   add_client_rules="$(client_rule_loop_add)"
@@ -1088,6 +1132,9 @@ main() {
         stop_singbox
         log "WARP forwarding disabled for $DEVICE"
       fi
+      ;;
+    register)
+      register_client_only
       ;;
     status)
       status

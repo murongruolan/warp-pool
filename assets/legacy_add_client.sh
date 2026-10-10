@@ -1,0 +1,1521 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_VERSION="2026.10.10-r22"
+
+# Add a non-main-server client to an existing legacy exclusive WarpPool node
+# (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
+# state directory, this edits the deployed config in place and applies it with
+# `wg syncconf`, so existing peers never lose their tunnel.
+
+ACTION="add"
+DEVICE=""
+LISTEN_PORT=""
+SERVER_ADDR=""
+MODE="dual"
+NAME=""
+CLIENT_PUBLIC_KEY=""
+WARP_CLIENT_PUBLIC_KEY=""
+CLIENT_PRIVATE_KEY=""
+WARP_CLIENT_PRIVATE_KEY=""
+ENDPOINT=""
+CLIENT_IP_OVERRIDE=""
+EGRESS=""
+ALLOWED_IPS="0.0.0.0/0, ::/0"
+CLIENT_DNS="1.1.1.1, 8.8.8.8"
+CONFIG_DIR="/root/warppool-clients"
+TRANSPARENT_PORT="14000"
+REGISTER_WARP="true"
+PRINT_CONFIG="true"
+DRY_RUN="false"
+INTERACTIVE="false"
+MODE_SET="false"
+MODE_CHOICE=""
+PUB_IP=""
+PUB_PORT=""
+CLIENT_DIRECT_FILE=""
+CLIENT_WARP_FILE=""
+ROLLBACK_BACKUP=""
+STATE_DIR="/etc/warppool-node/legacy-clients"
+BASE_URL="${WARPPOOL_INSTALL_BASE_URL:-${WARPOOL_INSTALL_BASE_URL:-https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets}}"
+DOWNLOAD_DIR="/tmp/warppool-legacy.$$"
+
+log() {
+  printf '[WarpPool][legacy-client] %s\n' "$*"
+}
+
+fail() {
+  printf '[WarpPool][legacy-client][ERROR] %s\n' "$*" >&2
+  exit 1
+}
+
+on_error() {
+  local status=$?
+  local line="$1"
+  printf '[WarpPool][legacy-client][ERROR] command failed with exit %s at line %s: %s\n' "$status" "$line" "$BASH_COMMAND" >&2
+  exit "$status"
+}
+
+cleanup_download_dir() {
+  if [ -n "${DOWNLOAD_DIR:-}" ] && [ -d "$DOWNLOAD_DIR" ]; then
+    rm -rf -- "$DOWNLOAD_DIR"
+  fi
+}
+
+trap 'on_error $LINENO' ERR
+trap 'cleanup_download_dir' EXIT
+
+usage() {
+  cat <<USAGE
+WarpPool legacy node client helper
+version ${SCRIPT_VERSION}
+
+Usage:
+  bash legacy_add_client.sh
+  bash legacy_add_client.sh -i
+  wpl-add-client
+
+  The commands above start a guided setup. It asks for the exit-node device,
+  the exit mode, the client label, the client public key, and the public
+  endpoint, then shows a preview and waits for confirmation.
+
+  bash legacy_add_client.sh action=add \
+      device=wp2-1 mode=direct|warp|dual name=<label> \
+      client_public_key=<key> [warp_client_public_key=<key>] \
+      [endpoint=<public-host:port>] [egress=<iface>] \
+      [config_dir=/root/warppool-clients] [transparent_port=14000] \
+      [register_warp=true|false] [allowed_ips=...] [dns=...] [--dry-run]
+
+  bash legacy_add_client.sh action=list device=wp2-1
+  bash legacy_add_client.sh action=remove device=wp2-1 name=<label>
+  bash legacy_add_client.sh action=rotate device=wp2-1 name=<label> \
+      client_public_key=<new-key> [warp_client_public_key=<new-key>] [--dry-run]
+
+  bash legacy_add_client.sh action=init device=wpnat \
+      [listen_port=51820] [server_addr=10.200.0.1/24] [egress=eth0] [--dry-run]
+
+action=init builds a brand new WireGuard server config on a node that has none,
+so the node can be used without any main server. It generates the server keypair,
+writes /etc/wireguard/<device>.conf with forwarding hooks, starts and enables the
+interface, and installs a systemd drop-in that retries a failed boot start. The
+config starts empty; add peers with action=add afterwards.
+
+action=rotate swaps a managed client's peer key in place. The tunnel address,
+the NAT rules and every other peer stay exactly as they are; only the
+PublicKey line changes.
+
+Adds a peer to an already deployed legacy exclusive config in place. The
+existing PrivateKey, Address, ListenPort and every current [Peer] block are
+preserved verbatim. Only PostUp/PostDown are rewritten, from hardcoded
+addresses into a loop over a NAT address file, so newly added direct clients
+survive a reboot. The change is applied with `wg syncconf`; the interface is
+never brought down.
+
+Only the PUBLIC key of the client is normally required. Private keys stay on
+the client machine and the generated config carries a PrivateKey placeholder.
+Choosing key source 2 in the guided setup generates the keypair on this node
+instead and writes the private key straight into the config.
+USAGE
+}
+
+parse_args() {
+  for arg in "$@"; do
+    case "$arg" in
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --dry-run)
+        DRY_RUN="true"
+        ;;
+      -i|--interactive)
+        INTERACTIVE="true"
+        ;;
+      action=*) ACTION="${arg#action=}" ;;
+      device=*) DEVICE="${arg#device=}" ;;
+      listen_port=*) LISTEN_PORT="${arg#listen_port=}" ;;
+      server_addr=*) SERVER_ADDR="${arg#server_addr=}" ;;
+      mode=*) MODE="${arg#mode=}"; MODE_SET="true" ;;
+      name=*) NAME="${arg#name=}" ;;
+      client_public_key=*) CLIENT_PUBLIC_KEY="${arg#client_public_key=}" ;;
+      warp_client_public_key=*) WARP_CLIENT_PUBLIC_KEY="${arg#warp_client_public_key=}" ;;
+      client_private_key=*) CLIENT_PRIVATE_KEY="${arg#client_private_key=}" ;;
+      warp_client_private_key=*) WARP_CLIENT_PRIVATE_KEY="${arg#warp_client_private_key=}" ;;
+      endpoint=*) ENDPOINT="${arg#endpoint=}" ;;
+      client_ip=*|address=*) CLIENT_IP_OVERRIDE="${arg#*=}" ;;
+      egress=*) EGRESS="${arg#egress=}" ;;
+      allowed_ips=*) ALLOWED_IPS="${arg#allowed_ips=}" ;;
+      dns=*) CLIENT_DNS="${arg#dns=}" ;;
+      config_dir=*) CONFIG_DIR="${arg#config_dir=}" ;;
+      transparent_port=*) TRANSPARENT_PORT="${arg#transparent_port=}" ;;
+      register_warp=*) REGISTER_WARP="${arg#register_warp=}" ;;
+      base_url=*) BASE_URL="${arg#base_url=}" ;;
+      *) fail "unknown argument: $arg" ;;
+    esac
+  done
+}
+
+validate_bool() {
+  case "$2" in
+    true|false) ;;
+    *) fail "$1 must be true or false, got: $2" ;;
+  esac
+}
+
+validate_args() {
+  case "$ACTION" in
+    add|list|remove|rotate|init) ;;
+    *) fail "unsupported action: $ACTION, expected add, list, remove, rotate, or init" ;;
+  esac
+  case "$MODE" in
+    direct|warp|dual) ;;
+    *) fail "unsupported mode: $MODE, expected direct, warp, or dual" ;;
+  esac
+  [ -n "$DEVICE" ] || fail "device=<wg-device> is required"
+  case "$DEVICE" in
+    ""|*[!a-zA-Z0-9_.-]*) fail "invalid device name: $DEVICE" ;;
+  esac
+  case "$TRANSPARENT_PORT" in
+    ""|*[!0-9]*) fail "invalid transparent_port: $TRANSPARENT_PORT" ;;
+  esac
+  validate_bool register_warp "$REGISTER_WARP"
+  validate_bool print_config "$PRINT_CONFIG"
+  if [ "$ACTION" = "add" ]; then
+    [ -n "$NAME" ] || fail "name=<label> is required"
+    [ -n "$CLIENT_PUBLIC_KEY" ] || fail "client_public_key is required"
+    if [ "$MODE" = "dual" ]; then
+      [ -n "$WARP_CLIENT_PUBLIC_KEY" ] || fail "warp_client_public_key is required in dual mode"
+    fi
+    if [ "$MODE" = "direct" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+      log "mode=direct ignores warp_client_public_key"
+      WARP_CLIENT_PUBLIC_KEY=""
+    fi
+  fi
+  if [ "$ACTION" = "remove" ]; then
+    [ -n "$NAME" ] || fail "name=<label> is required"
+  fi
+  if [ "$ACTION" = "rotate" ]; then
+    [ -n "$NAME" ] || fail "name=<label> is required"
+    [ -n "$CLIENT_PUBLIC_KEY" ] || fail "client_public_key=<new-key> is required"
+  fi
+}
+
+require_root() {
+  if [ "$DRY_RUN" = "true" ]; then
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    fail "must run as root"
+  fi
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+run() {
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: $*"
+    return 0
+  fi
+  "$@"
+}
+
+state_paths() {
+  CONF="/etc/wireguard/$DEVICE.conf"
+  CLIENT_STATE_DIR="$STATE_DIR/$DEVICE"
+  NAT_V4_FILE="$CLIENT_STATE_DIR/$DEVICE.nat"
+}
+
+# wg-quick refuses a config whose filename is not a valid interface name
+# (<= 15 chars, [A-Za-z0-9_=+.-]), so temp files must not embed the device name
+# and a full PID. These stay well under the limit.
+temp_conf_path() {
+  printf '/tmp/wg.%s.%s.conf\n' "$1" "$$"
+}
+
+download_script() {
+  local name="$1"
+  local target="$2"
+  require_command curl
+  log "downloading $name from $BASE_URL" >&2
+  curl -fsSL "$BASE_URL/$name" -o "$target" || fail "failed to download $name from $BASE_URL"
+  chmod 0755 "$target"
+}
+
+helper_path() {
+  local name="$1"
+  local dir candidate
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+  # Prefer anything already on disk. Fetching from the release URL at run time
+  # is the last resort: a node installed from an older release would otherwise
+  # pull a mismatched helper (that is how `action=register` went missing).
+  for candidate in \
+    "$dir/$name" \
+    "/usr/local/lib/warppool/node/$name" \
+    "/root/$name" \
+    "/tmp/warppool-install/$name" \
+    "/tmp/warppool-mode/$name"
+  do
+    if [ -r "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  mkdir -p "$DOWNLOAD_DIR"
+  download_script "$name" "$DOWNLOAD_DIR/$name"
+  printf '%s\n' "$DOWNLOAD_DIR/$name"
+}
+
+sanitize_name() {
+  printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/-/g; s/^[-.]*//; s/[-.]*$//' | cut -c1-32
+}
+
+is_public_key() {
+  case "$1" in
+    ""|*[!A-Za-z0-9+/=]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 44 ] && [ "${1: -1}" = "=" ]
+}
+
+load_conf_meta() {
+  [ -r "$CONF" ] || fail "config not found: $CONF"
+
+  if grep -q 'ip6tables' "$CONF"; then
+    fail "$CONF contains ip6tables rules. This helper only manages IPv4 NAT and will not rewrite IPv6 forwarding rules. Migrate the node to the shared wpshared layout instead."
+  fi
+
+  SERVER_PRIVATE_KEY="$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | tr -d '[:space:]')"
+  [ -n "$SERVER_PRIVATE_KEY" ] || fail "cannot read PrivateKey from $CONF"
+  SERVER_ADDRESS="$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | tr -d '[:space:]')"
+  [ -n "$SERVER_ADDRESS" ] || fail "cannot read Address from $CONF"
+  SERVER_IP="${SERVER_ADDRESS%%/*}"
+  IP_PREFIX="$(printf '%s' "$SERVER_IP" | awk -F. '{print $1"."$2"."$3}')"
+  SERVER_PUBLIC_KEY="$(printf '%s' "$SERVER_PRIVATE_KEY" | wg pubkey)"
+
+  if [ -z "$EGRESS" ]; then
+    EGRESS="$(sed -n 's/.*POSTROUTING -s [0-9.]*\/32 -o \([^ ]*\) -j MASQUERADE.*/\1/p' "$CONF" | head -n 1)"
+  fi
+  if [ -z "$EGRESS" ]; then
+    EGRESS="$(ip route show default 0.0.0.0/0 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  fi
+  [ -n "$EGRESS" ] || fail "cannot detect the egress interface; pass egress=<iface>"
+}
+
+used_ips() {
+  {
+    sed -n 's/^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*//p' "$CONF" |
+      tr ',' '\n' |
+      sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|/.*||' |
+      grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || true
+    # Addresses handed out earlier in this same run, so a dual-mode client
+    # never receives the same address twice.
+    printf '%s\n' "${RESERVED_IPS:-}"
+  } | sort -u
+}
+
+# Sets ALLOCATED_IP instead of printing it: the caller must stay in this shell,
+# otherwise RESERVED_IPS would be updated inside a subshell and lost.
+allocate_ip() {
+  local n candidate
+  USED_IPS="$(used_ips)"
+  for n in $(seq 2 254); do
+    candidate="$IP_PREFIX.$n"
+    if ! printf '%s\n' "$USED_IPS" | grep -Fxq "$candidate"; then
+      RESERVED_IPS="${RESERVED_IPS:+$RESERVED_IPS
+}$candidate"
+      ALLOCATED_IP="$candidate"
+      return 0
+    fi
+  done
+  fail "no free tunnel address left in $IP_PREFIX.0/24"
+}
+
+register_warp_client() {
+  local ip="$1"
+  local forwarder
+  [ -n "$ip" ] || return 0
+  forwarder="$(helper_path warp_forward.sh)"
+  log "registering WARP forwarding client $ip on $DEVICE (no forwarder restart)"
+  run bash "$forwarder" action=register \
+    device="$DEVICE" client_addr="$ip" \
+    server_addr="$SERVER_ADDRESS" transparent_port="$TRANSPARENT_PORT"
+}
+
+unregister_warp_client() {
+  local ip="$1"
+  local forwarder
+  [ -n "$ip" ] || return 0
+  forwarder="$(helper_path warp_forward.sh)"
+  log "unregistering WARP forwarding client $ip on $DEVICE"
+  run bash "$forwarder" action=down \
+    device="$DEVICE" client_addr="$ip" \
+    server_addr="$SERVER_ADDRESS" transparent_port="$TRANSPARENT_PORT"
+}
+
+render_hooks() {
+  local addr_list="$1"
+  local nat_up="" nat_down=""
+  if [ -n "$addr_list" ]; then
+    nat_up="; for ip in $addr_list; do iptables -t nat -C POSTROUTING -s \"\$ip/32\" -o $EGRESS -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s \"\$ip/32\" -o $EGRESS -j MASQUERADE; done"
+    nat_down="; for ip in $addr_list; do iptables -t nat -D POSTROUTING -s \"\$ip/32\" -o $EGRESS -j MASQUERADE 2>/dev/null || true; done"
+  fi
+  printf 'PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -C FORWARD -i %%i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %%i -j ACCEPT; iptables -C FORWARD -o %%i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %%i -m state --state RELATED,ESTABLISHED -j ACCEPT%s\n' "$nat_up"
+  printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %%i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true%s\n' "$nat_down"
+}
+
+# The NAT address list is embedded in PostUp/PostDown ("for ip in A B; do"),
+# so the config file is the single source of truth and no external file has to
+# survive a reboot. Three source forms are recognised:
+#   1. the inline loop form this script writes
+#   2. the literal form the Go deploy path writes
+#      ("iptables -t nat -A POSTROUTING -s 10.0.0.2/32 -o eth0 -j MASQUERADE")
+#   3. the legacy external file
+# Missing form 2 is how a freshly deployed node silently lost its first
+# client's MASQUERADE rule: the rule survived in the running kernel, so nothing
+# looked wrong until the next reboot.
+read_nat_addresses() {
+  {
+    sed -n 's/.*for ip in \([^;]*\); do.*/\1/p' "$CONF" 2>/dev/null | tr ' ' '\n'
+    sed -n 's/.*POSTROUTING -s \([0-9.]*\)\/32 -o [^ ]* -j MASQUERADE.*/\1/p' "$CONF" 2>/dev/null
+    if [ -r "$NAT_V4_FILE" ]; then
+      cat "$NAT_V4_FILE"
+    fi
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u || true
+}
+
+# IPv4 tunnel addresses present in the config but deliberately not NATed
+# (WARP-only peers). Printed so a missing direct client is visible.
+#
+# The candidate list is captured into a variable and the pipeline ends with
+# `|| true`: with `set -o pipefail` a grep that matches nothing (a config with
+# no peers yet, which is exactly what action=init produces) would otherwise
+# abort the whole run.
+unnatd_addresses() {
+  local nat_list="$1" candidates
+  candidates="$(sed -n 's/^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null |
+    tr ',' '\n' |
+    sed 's/^[[:space:]]*//; s|/.*||' |
+    grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' |
+    sort -u || true)"
+  [ -n "$candidates" ] || return 0
+  # awk exits 0 even with no output, unlike grep, so this filter is pipefail-safe.
+  printf '%s\n' "$candidates" |
+    awk -v list="$nat_list" '
+      BEGIN { n = split(list, arr, " "); for (i = 1; i <= n; i++) nat[arr[i]] = 1; sep = "" }
+      !($0 in nat) { printf "%s%s", sep, $0; sep = " " }
+      END { if (sep != "") printf "\n" }
+    ' || true
+  return 0
+}
+
+render_peer() {
+  local public_key="$1" address="$2"
+  [ -n "$public_key" ] || return 0
+  printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n' "$public_key" "$address"
+}
+
+render_client_config() {
+  local address="$1" private_key="$2"
+  printf '[Interface]\n'
+  if [ -n "$private_key" ]; then
+    printf 'PrivateKey = %s\n' "$private_key"
+  else
+    printf '# 把下面这一行替换成你在电脑上生成的私钥\nPrivateKey = REPLACE_WITH_YOUR_PRIVATE_KEY\n'
+  fi
+  printf 'Address = %s/32\n' "$address"
+  printf 'DNS = %s\n' "$CLIENT_DNS"
+  printf '\n[Peer]\n'
+  printf 'PublicKey = %s\n' "$SERVER_PUBLIC_KEY"
+  printf 'Endpoint = %s\n' "$ENDPOINT"
+  printf 'AllowedIPs = %s\n' "$ALLOWED_IPS"
+  printf 'PersistentKeepalive = 25\n'
+}
+
+add_client() {
+  NAME="$(sanitize_name "$NAME")"
+  [ -n "$NAME" ] || fail "name is invalid after sanitizing"
+  is_public_key "$CLIENT_PUBLIC_KEY" || fail "client_public_key does not look like a WireGuard public key"
+  if [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+    is_public_key "$WARP_CLIENT_PUBLIC_KEY" || fail "warp_client_public_key does not look like a WireGuard public key"
+  fi
+  if [ -r "$CLIENT_STATE_DIR/$NAME.env" ]; then
+    fail "client already registered: $NAME (remove it first, or choose another name)"
+  fi
+
+  load_conf_meta
+
+  if grep -Fq "$CLIENT_PUBLIC_KEY" "$CONF"; then
+    fail "this public key is already a peer in $CONF"
+  fi
+
+  local direct_ip warp_ip primary_ip
+  direct_ip=""
+  warp_ip=""
+  RESERVED_IPS=""
+  case "$MODE" in
+    direct)
+      if [ -n "$CLIENT_IP_OVERRIDE" ]; then
+        direct_ip="$CLIENT_IP_OVERRIDE"
+      else
+        allocate_ip
+        direct_ip="$ALLOCATED_IP"
+      fi
+      ;;
+    warp)
+      if [ -n "$CLIENT_IP_OVERRIDE" ]; then
+        warp_ip="$CLIENT_IP_OVERRIDE"
+      else
+        allocate_ip
+        warp_ip="$ALLOCATED_IP"
+      fi
+      ;;
+    dual)
+      if [ -n "$CLIENT_IP_OVERRIDE" ]; then
+        direct_ip="$CLIENT_IP_OVERRIDE"
+      else
+        allocate_ip
+        direct_ip="$ALLOCATED_IP"
+      fi
+      allocate_ip
+      warp_ip="$ALLOCATED_IP"
+      ;;
+  esac
+  if [ -n "$direct_ip" ]; then
+    case "$direct_ip" in
+      *[!0-9.]*|"") fail "invalid client_ip: $direct_ip" ;;
+    esac
+    RESERVED_IPS="${RESERVED_IPS:+$RESERVED_IPS
+}$direct_ip"
+  fi
+  if [ -n "$direct_ip" ]; then
+    primary_ip="$direct_ip"
+  else
+    primary_ip="$warp_ip"
+  fi
+
+  log "device=$DEVICE mode=$MODE server=$SERVER_IP egress=$EGRESS"
+  log "assigned direct=${direct_ip:-none} warp=${warp_ip:-none}"
+
+  local ts backup tmp
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$CONF.bak.$ts"
+
+  # 1. NAT address list. Union of whatever the config already carries (inline
+  #    in PostUp, or the legacy external file) and the address just allocated.
+  #    The result is embedded into the new PostUp, so the config file becomes
+  #    the single source of truth and nothing outside it has to survive a
+  #    reboot.
+  mkdir -p "$CLIENT_STATE_DIR"
+  chmod 0700 "$CLIENT_STATE_DIR"
+  local nat_list
+  nat_list="$({
+    read_nat_addresses
+    if [ -n "$direct_ip" ]; then
+      printf '%s\n' "$direct_ip"
+    fi
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)"
+
+  # An empty list is only an error when a direct client was just allocated:
+  # a warp-only node legitimately has no NATed addresses at all.
+  if [ -n "$direct_ip" ] && ! printf '%s\n' $nat_list | grep -qxF "$direct_ip"; then
+    fail "the new direct address $direct_ip is missing from the NAT list; refusing to proceed. Inspect $CONF before retrying."
+  fi
+  log "NAT address list embedded into PostUp: ${nat_list:-<empty, no direct clients>}"
+  local not_natd
+  not_natd="$(unnatd_addresses "$nat_list")"
+  if [ -n "$not_natd" ]; then
+    log "not NATed (treated as WARP-only tunnels): $not_natd"
+  fi
+
+  # 2. Render the new config. The Interface section is rebuilt explicitly so
+  #    that SaveConfig and the PostUp/PostDown hooks stay INSIDE the section:
+  #    wg-quick only strips those keys when they follow [Interface], and passes
+  #    them through to wg otherwise, which aborts the sync.
+  local save_config
+  save_config="$(sed -n 's/^[[:space:]]*SaveConfig[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | tr -d '[:space:]')"
+  [ -n "$save_config" ] || save_config="false"
+
+  local iface_keys bad_keys
+  iface_keys="$(sed -n '/^[[:space:]]*\[Interface\]/,/^[[:space:]]*\[Peer\]/p' "$CONF" |
+    grep -E '=' |
+    sed -E 's/^[[:space:]]*([A-Za-z]+)[[:space:]]*=.*/\1/' |
+    sort -u)"
+  bad_keys="$(printf '%s\n' "$iface_keys" | grep -vE '^(PrivateKey|Address|ListenPort|SaveConfig|PostUp|PostDown)$' || true)"
+  if [ -n "$bad_keys" ]; then
+    fail "$CONF has Interface keys this helper will not rebuild: $(printf '%s' "$bad_keys" | tr '\n' ' ')"
+  fi
+
+  tmp="$(temp_conf_path a)"
+  {
+    printf '[Interface]\n'
+    sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/PrivateKey = /'
+    sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/Address = /'
+    sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/ListenPort = /'
+    printf 'SaveConfig = %s\n' "$save_config"
+    render_hooks "$nat_list"
+    printf '\n'
+    sed -n '/^[[:space:]]*\[Peer\]/,$p' "$CONF"
+    render_peer "$CLIENT_PUBLIC_KEY" "$primary_ip"
+    if [ "$MODE" = "dual" ]; then
+      render_peer "$WARP_CLIENT_PUBLIC_KEY" "$warp_ip"
+    fi
+  } >"$tmp.raw"
+  # Squeeze repeated blank lines: a remove+re-add cycle would otherwise add one
+  # blank line before the last [Peer] every time.
+  cat -s "$tmp.raw" >"$tmp"
+  rm -f "$tmp.raw"
+  chmod 0600 "$tmp"
+
+  log "new config rendered: $tmp"
+  sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
+
+  # 3. Validate before touching anything. wg-quick exits 0 even when it leaks a
+  #    wg-quick-only directive, so inspect the stripped output explicitly.
+  local stripped
+  if ! stripped="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "rendered config failed wg-quick validation; nothing was changed"
+  fi
+  local leaked
+  leaked="$(printf '%s\n' "$stripped" |
+    grep -E '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*=' || true)"
+  if [ -n "$leaked" ]; then
+    fail "rendered config still leaks wg-quick-only directives: $(printf '%s' "$leaked" | tr '\n' ' '); nothing was changed"
+  fi
+  if ! printf '%s\n' "$stripped" | grep -q '^PrivateKey'; then
+    fail "rendered config lost the server PrivateKey; nothing was changed"
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: stopping before backup and apply"
+    return 0
+  fi
+
+  cp -a "$CONF" "$backup"
+  log "backup: $backup"
+  ROLLBACK_BACKUP="$backup"
+
+  install -m 0600 "$tmp" "$CONF"
+  log "installed: $CONF"
+
+  # 4. Hot apply. The interface stays up; existing peers keep their sessions.
+  #    If the apply fails for any reason, put the previous config straight back
+  #    so the node never keeps a broken file on disk.
+  require_command wg
+  if ! wg syncconf "$DEVICE" <(wg-quick strip "$CONF"); then
+    log "syncconf FAILED - restoring $CONF from $backup"
+    cp -a "$backup" "$CONF"
+    fail "hot apply failed; the previous config has been restored, nothing was lost"
+  fi
+  log "hot applied with wg syncconf"
+
+  # 5. NAT rules for every direct client (PostUp only runs on interface start,
+  #    so reconcile now from the list just embedded into the config).
+  if [ -n "$nat_list" ]; then
+    for ip in $nat_list; do
+      iptables -t nat -C POSTROUTING -s "$ip/32" -o "$EGRESS" -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s "$ip/32" -o "$EGRESS" -j MASQUERADE
+    done
+    log "MASQUERADE rules reconciled for: $nat_list"
+  fi
+
+  # 6. WARP forwarding for the new warp client. This step can fail for reasons
+  #    outside our control (the WARP runtime is not connected yet). If it does,
+  #    roll the peer back: otherwise the config keeps a peer that has no registry
+  #    record, and the node ends up in the inconsistent state we hit before.
+  if [ "$REGISTER_WARP" = "true" ] && [ -n "$warp_ip" ]; then
+    if ! register_warp_client "$warp_ip"; then
+      log "WARP registration FAILED - rolling $CONF back from $backup"
+      cp -a "$backup" "$CONF"
+      wg syncconf "$DEVICE" <(wg-quick strip "$CONF") || true
+      if [ -n "$direct_ip" ]; then
+        while iptables -t nat -C POSTROUTING -s "$direct_ip/32" -o "$EGRESS" -j MASQUERADE >/dev/null 2>&1; do
+          iptables -t nat -D POSTROUTING -s "$direct_ip/32" -o "$EGRESS" -j MASQUERADE
+        done
+      fi
+      fail "WARP registration failed and the peer was rolled back; nothing was left behind.
+Check that Cloudflare WARP is connected on this node (warp-cli status / systemctl status warp-svc), then retry."
+    fi
+  fi
+
+  # 7. Client configs. Skipped when no endpoint was supplied: without one the
+  #    config cannot dial anything, and the main-server add flow deliberately
+  #    does not ask for it (that peer keeps its own config).
+  CLIENT_DIRECT_FILE=""
+  CLIENT_WARP_FILE=""
+  if [ -n "$ENDPOINT" ]; then
+  mkdir -p "$CONFIG_DIR"
+  chmod 0700 "$CONFIG_DIR"
+  local direct_file="" warp_file=""
+  case "$MODE" in
+    dual)
+      direct_file="$CONFIG_DIR/$NAME-direct.conf"
+      warp_file="$CONFIG_DIR/$NAME-warp.conf"
+      ;;
+    warp)
+      warp_file="$CONFIG_DIR/$NAME.conf"
+      ;;
+    *)
+      direct_file="$CONFIG_DIR/$NAME.conf"
+      ;;
+  esac
+  if [ -n "$direct_ip" ] && [ -n "$direct_file" ]; then
+    render_client_config "$direct_ip" "$CLIENT_PRIVATE_KEY" >"$direct_file"
+    chmod 0600 "$direct_file"
+    CLIENT_DIRECT_FILE="$direct_file"
+  fi
+  if [ -n "$warp_ip" ] && [ -n "$warp_file" ]; then
+    # In warp-only mode the single peer IS client_public_key, so its config must
+    # carry client_private_key. warp_client_* only backs the second peer in dual
+    # mode; using it here produced a config whose key did not match its peer.
+    local warp_priv="$CLIENT_PRIVATE_KEY"
+    if [ "$MODE" = "dual" ]; then
+      warp_priv="$WARP_CLIENT_PRIVATE_KEY"
+    fi
+    render_client_config "$warp_ip" "$warp_priv" >"$warp_file"
+    chmod 0600 "$warp_file"
+    CLIENT_WARP_FILE="$warp_file"
+  fi
+  fi
+
+  cat >"$CLIENT_STATE_DIR/$NAME.env" <<EOF
+NAME='$NAME'
+MODE='$MODE'
+CREATED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
+CLIENT_PUBLIC_KEY='$CLIENT_PUBLIC_KEY'
+CLIENT_PRIVATE_KEY='$CLIENT_PRIVATE_KEY'
+CLIENT_IPV4='$direct_ip'
+WARP_CLIENT_PUBLIC_KEY='$WARP_CLIENT_PUBLIC_KEY'
+WARP_CLIENT_PRIVATE_KEY='$WARP_CLIENT_PRIVATE_KEY'
+WARP_CLIENT_IPV4='$warp_ip'
+ENDPOINT='$ENDPOINT'
+EOF
+  chmod 0600 "$CLIENT_STATE_DIR/$NAME.env"
+
+  printf '\n'
+  printf '===== client added =====\n'
+  printf '  name        : %s\n' "$NAME"
+  printf '  mode        : %s\n' "$MODE"
+  printf '  device      : %s\n' "$DEVICE"
+  printf '  endpoint    : %s\n' "$ENDPOINT"
+  printf '  server addr : %s\n' "$SERVER_ADDRESS"
+  if [ -n "$direct_ip" ]; then
+    printf '  direct addr : %s\n' "$direct_ip"
+    printf '  direct file : %s\n' "$CLIENT_DIRECT_FILE"
+  fi
+  if [ -n "$warp_ip" ]; then
+    printf '  warp addr   : %s\n' "$warp_ip"
+    printf '  warp file   : %s\n' "$CLIENT_WARP_FILE"
+  fi
+  printf '  rollback    : cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$backup" "$CONF" "$DEVICE" "$CONF"
+
+  if [ "$PRINT_CONFIG" = "true" ]; then
+    if [ -n "$CLIENT_DIRECT_FILE" ] && [ -r "$CLIENT_DIRECT_FILE" ]; then
+      printf '\n----- BEGIN direct config (%s) -----\n' "$NAME"
+      cat "$CLIENT_DIRECT_FILE"
+      printf -- '----- END direct config (%s) -----\n' "$NAME"
+    fi
+    if [ -n "$CLIENT_WARP_FILE" ] && [ -r "$CLIENT_WARP_FILE" ]; then
+      printf '\n----- BEGIN WARP config (%s) -----\n' "$NAME"
+      cat "$CLIENT_WARP_FILE"
+      printf -- '----- END WARP config (%s) -----\n' "$NAME"
+    fi
+  fi
+}
+
+list_clients() {
+  load_conf_meta
+  printf 'device=%s listen=%s server=%s egress=%s\n' \
+    "$DEVICE" \
+    "$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | tr -d '[:space:]')" \
+    "$SERVER_ADDRESS" "$EGRESS"
+  printf '\n--- peers currently in %s ---\n' "$CONF"
+  if command -v wg >/dev/null 2>&1; then
+    wg show "$DEVICE" 2>/dev/null || true
+  fi
+  printf '\n--- managed clients ---\n'
+  local f found=0
+  for f in "$CLIENT_STATE_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    found=1
+    NAME=""
+    MODE=""
+    CLIENT_PUBLIC_KEY=""
+    CLIENT_PRIVATE_KEY=""
+    CLIENT_IPV4=""
+    WARP_CLIENT_PUBLIC_KEY=""
+    WARP_CLIENT_IPV4=""
+    CREATED_AT=""
+    ROTATED_AT=""
+    # shellcheck disable=SC1090
+    . "$f"
+    printf '\n  name     : %s\n' "$NAME"
+    printf '    mode     : %s\n' "$MODE"
+    printf '    created  : %s\n' "$CREATED_AT"
+    if [ -n "${ROTATED_AT:-}" ]; then
+      printf '    rotated  : %s\n' "$ROTATED_AT"
+    fi
+    printf '    direct   : %s\n' "${CLIENT_IPV4:-none}"
+    printf '      key    : %s\n' "${CLIENT_PUBLIC_KEY:-none}"
+    printf '      priv   : %s\n' "$([ -n "${CLIENT_PRIVATE_KEY:-}" ] && echo '<held on this node>' || echo '<not on this node>')"
+    printf '    warp     : %s\n' "${WARP_CLIENT_IPV4:-none}"
+    printf '      key    : %s\n' "${WARP_CLIENT_PUBLIC_KEY:-none}"
+  done
+  if [ "$found" -eq 0 ]; then
+    printf '\n  (none)\n'
+  fi
+}
+
+remove_client() {
+  NAME="$(sanitize_name "$NAME")"
+  local state="$CLIENT_STATE_DIR/$NAME.env"
+  [ -r "$state" ] || fail "no managed client named $NAME (see action=list)"
+  load_conf_meta
+
+  local cpub wpub dip wip created mode
+  NAME=""
+  MODE=""
+  CLIENT_PUBLIC_KEY=""
+  CLIENT_IPV4=""
+  WARP_CLIENT_PUBLIC_KEY=""
+  WARP_CLIENT_IPV4=""
+  CREATED_AT=""
+  # shellcheck disable=SC1090
+  . "$state"
+  cpub="$CLIENT_PUBLIC_KEY"
+  wpub="$WARP_CLIENT_PUBLIC_KEY"
+  dip="$CLIENT_IPV4"
+  wip="$WARP_CLIENT_IPV4"
+  created="$CREATED_AT"
+  mode="$MODE"
+
+  log "removing client $NAME (created $created, mode $mode)"
+
+  local ts backup tmp
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$CONF.bak.$ts"
+  tmp="$(temp_conf_path d)"
+
+  # Drop whole [Peer] paragraphs whose PublicKey matches. Paragraph mode keeps
+  # every other line of the file byte-identical.
+  awk -v k1="$cpub" -v k2="$wpub" '
+    BEGIN { RS = ""; sep = "" }
+    index($0, "PublicKey = " k1) > 0 { next }
+    k2 != "" && index($0, "PublicKey = " k2) > 0 { next }
+    { printf "%s%s\n", sep, $0; sep = "\n" }
+  ' "$CONF" >"$tmp"
+
+  # Drop the removed address from the inline NAT list in PostUp/PostDown.
+  # Computed from $CONF, which is still the pre-removal file at this point.
+  if [ -n "$dip" ]; then
+    local new_nat
+    new_nat="$(read_nat_addresses | grep -vxF "$dip" | tr '\n' ' ' | sed 's/ *$//' || true)"
+    if ! awk -v addrs="$new_nat" '
+        /^(PostUp|PostDown) = / {
+          if (addrs == "") {
+            sub(/; for ip in .*; done/, "")
+          } else {
+            sub(/for ip in [^;]*; do/, "for ip in " addrs "; do")
+          }
+          print
+          next
+        }
+        { print }
+      ' "$tmp" >"$tmp.hooks"; then
+      rm -f "$tmp.hooks"
+      fail "failed to rewrite the NAT address list in the rendered config; nothing was changed"
+    fi
+    mv "$tmp.hooks" "$tmp"
+    log "NAT address list after removal: ${new_nat:-<empty, NAT loop dropped>}"
+  fi
+
+  # Guard against a paragraph-mode surprise wiping unrelated peers.
+  local before after expected
+  before="$(grep -c '^[[:space:]]*\[Peer\]' "$CONF" || true)"
+  after="$(grep -c '^[[:space:]]*\[Peer\]' "$tmp" || true)"
+  expected=1
+  if [ -n "$wpub" ]; then
+    expected=2
+  fi
+  if [ "$((before - after))" -ne "$expected" ]; then
+    fail "removal render dropped $((before - after)) peers but $expected was targeted; nothing was changed"
+  fi
+
+  local stripped_removed
+  if ! stripped_removed="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "removal render failed validation; nothing was changed"
+  fi
+  if printf '%s\n' "$stripped_removed" |
+    grep -qE '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*='; then
+    fail "removal render leaks wg-quick-only directives; nothing was changed"
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: would install:"
+    sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
+    return 0
+  fi
+
+  cp -a "$CONF" "$backup"
+  install -m 0600 "$tmp" "$CONF"
+  if ! wg syncconf "$DEVICE" <(wg-quick strip "$CONF"); then
+    log "syncconf FAILED - restoring $CONF from $backup"
+    cp -a "$backup" "$CONF"
+    fail "removal hot apply failed; the previous config has been restored"
+  fi
+  log "hot applied removal"
+
+  if [ -n "$dip" ]; then
+    while iptables -t nat -C POSTROUTING -s "${dip}/32" -o "$EGRESS" -j MASQUERADE >/dev/null 2>&1; do
+      run iptables -t nat -D POSTROUTING -s "${dip}/32" -o "$EGRESS" -j MASQUERADE
+    done
+    # Keep the legacy external file in sync if a deployment still has one.
+    if [ -r "$NAT_V4_FILE" ]; then
+      grep -vxF "$dip" "$NAT_V4_FILE" >"$NAT_V4_FILE.new" || :
+      if [ -s "$NAT_V4_FILE.new" ]; then
+        mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
+      else
+        rm -f "$NAT_V4_FILE.new"
+      fi
+    fi
+  fi
+
+  if [ "$REGISTER_WARP" = "true" ] && [ -n "$wip" ]; then
+    unregister_warp_client "$wip"
+  fi
+
+  rm -f "$state" "$CONFIG_DIR/$NAME.conf" "$CONFIG_DIR/$NAME-direct.conf" "$CONFIG_DIR/$NAME-warp.conf"
+  log "removed $NAME; other peers keep their tunnels"
+  log "rollback: cp $backup $CONF && wg syncconf $DEVICE <(wg-quick strip $CONF)"
+}
+
+install_shortcut() {
+  local target="/usr/local/bin/wpl-add-client"
+  local src dir
+  if [ "${INSTALL_SHORTCUT:-true}" = "false" ]; then
+    return 0
+  fi
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+  src="$dir/$(basename -- "${BASH_SOURCE[0]}")"
+  [ "$src" != "$target" ] || return 0
+  if ln -sf "$src" "$target" 2>/dev/null; then
+    chmod 0755 "$target" 2>/dev/null || true
+    log "已安装短命令: $target"
+  elif cp -f "$src" "$target" 2>/dev/null; then
+    chmod 0755 "$target" 2>/dev/null || true
+    log "已安装短命令: $target"
+  fi
+  return 0
+}
+
+prompt() {
+  local var="$1" label="$2" default="${3:-}" reply
+  if [ -n "$default" ]; then
+    printf '%s [%s]: ' "$label" "$default" >&2
+  else
+    printf '%s: ' "$label" >&2
+  fi
+  if ! IFS= read -r reply; then
+    fail "no input received; nothing was changed"
+  fi
+  reply="${reply:-$default}"
+  reply="$(printf '%s' "$reply" | tr -d '[:space:]')"
+  printf -v "$var" '%s' "$reply"
+}
+
+detect_single_device() {
+  local found
+  found="$(find /etc/wireguard -maxdepth 1 -name 'wp*.conf' -type f 2>/dev/null | sort)"
+  local count
+  count="$(printf '%s\n' "$found" | grep -c . || true)"
+  if [ "$count" -eq 1 ]; then
+    basename "$found" .conf
+    return 0
+  fi
+  return 1
+}
+
+last_known_endpoint() {
+  local f
+  for f in "$CLIENT_STATE_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    grep -h '^ENDPOINT=' "$f" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d "'"
+  done
+}
+
+listen_port_hint() {
+  sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null |
+    head -n 1 | tr -d '[:space:]'
+}
+
+# A peer's endpoint is the address the CLIENT connects FROM. On a NAT host that
+# is the intermediate's address, not the address clients must dial — using it as
+# a hint would suggest the main server's own IP. Ask an external service for
+# this node's public address instead; on a 1:1 NAT VPS that returns exactly the
+# address clients reach the node on.
+guess_public_ip() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if [ -z "$ip" ] && command -v wget >/dev/null 2>&1; then
+    ip="$(wget -qO- -T 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  case "$ip" in
+    *[!0-9.]*|"") ip="" ;;
+  esac
+  printf '%s' "$ip"
+}
+
+last_known_port() {
+  last_known_endpoint | head -n 1 | awk -F: '{print $NF}'
+}
+
+interactive() {
+  ACTION="add"
+  install_shortcut
+  printf '\n'
+  printf '===== WarpPool 出口节点：接入非主服务器客户端 =====\n\n'
+
+  if [ -z "$DEVICE" ]; then
+    if DEVICE="$(detect_single_device)"; then
+      log "自动识别出口节点设备: $DEVICE"
+    else
+      prompt DEVICE "出口节点 WireGuard 设备名（/etc/wireguard/<name>.conf）" ""
+    fi
+  fi
+  state_paths
+
+  if [ "$MODE_SET" != "true" ]; then
+    while true; do
+      prompt MODE_CHOICE "出口模式   1=direct 本机出口   2=warp WARP出口   3=dual 两者都要" "1"
+      case "$MODE_CHOICE" in
+        1|direct)
+          MODE="direct"
+          log "出口模式: direct（流量走本机出口 IP）"
+          break
+          ;;
+        2|warp)
+          MODE="warp"
+          log "出口模式: warp（流量走 Cloudflare WARP 出口 IP）"
+          break
+          ;;
+        3|dual)
+          MODE="dual"
+          log "出口模式: dual（本机出口 + WARP 出口 各一条隧道）"
+          break
+          ;;
+        *) log "请输入 1、2 或 3" ;;
+      esac
+    done
+  fi
+
+  if [ -z "$NAME" ]; then
+    if [ "$MODE" = "warp" ]; then
+      prompt NAME "客户端名称（这条是 WARP 隧道，建议和直连那条区分开，例如 pc-warp）" "pc-warp"
+    else
+      prompt NAME "客户端名称（用于标记这台客户端）" "pc"
+    fi
+  fi
+
+  while true; do
+    prompt CLIENT_PUBLIC_KEY "粘贴客户端公钥（WireGuard 生成，44 字符；直接回车则由本节点生成）" ""
+    if [ -z "$CLIENT_PUBLIC_KEY" ]; then
+      require_command wg
+      CLIENT_PRIVATE_KEY="$(wg genkey)"
+      CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
+      log "已在本节点生成密钥对，私钥会直接写进配置"
+      break
+    fi
+    if is_public_key "$CLIENT_PUBLIC_KEY"; then
+      break
+    fi
+    log "公钥格式不对，请重新输入，或直接回车让本节点生成"
+  done
+
+  if [ "$MODE" = "dual" ]; then
+    while true; do
+      prompt WARP_CLIENT_PUBLIC_KEY "粘贴第二条 WARP 隧道公钥（必须与上面不同；直接回车则由本节点生成）" ""
+      if [ -z "$WARP_CLIENT_PUBLIC_KEY" ]; then
+        require_command wg
+        WARP_CLIENT_PRIVATE_KEY="$(wg genkey)"
+        WARP_CLIENT_PUBLIC_KEY="$(printf '%s' "$WARP_CLIENT_PRIVATE_KEY" | wg pubkey)"
+        log "已在本节点生成 WARP 密钥对，私钥会直接写进配置"
+        break
+      fi
+      if ! is_public_key "$WARP_CLIENT_PUBLIC_KEY"; then
+        log "公钥格式不对，请重新输入，或直接回车让本节点生成"
+        continue
+      fi
+      if [ "$WARP_CLIENT_PUBLIC_KEY" = "$CLIENT_PUBLIC_KEY" ]; then
+        log "两条隧道不能用同一个公钥（同一接口不允许重复 peer key），请换一个，或直接回车让本节点生成"
+        continue
+      fi
+      break
+    done
+  fi
+
+  if [ -z "$ENDPOINT" ]; then
+    local lp ip_hint port_hint
+    lp="$(listen_port_hint)"
+    [ -n "$lp" ] || lp="51820"
+    ip_hint="$(guess_public_ip)"
+    port_hint="$(last_known_port)"
+    printf '\n'
+    printf '出口节点 %s 在本机监听 UDP %s\n' "$DEVICE" "$lp"
+    printf 'NAT 上需要有一条 公网端口 -> 本机 %s 的 UDP 映射，客户端连的就是这条映射\n' "$lp"
+    printf '（主服务器用的就是这条映射，请填相同的公网端口）\n\n'
+    prompt PUB_IP "公网 IP（NAT 机器对外的地址）" "$ip_hint"
+    prompt PUB_PORT "公网映射端口（NAT 上的外部端口）" "$port_hint"
+    if [ -z "$PUB_IP" ]; then
+      fail "公网 IP 不能为空"
+    fi
+    if [ -z "$PUB_PORT" ]; then
+      fail "公网映射端口不能为空"
+    fi
+    case "$PUB_PORT" in
+      ""|*[!0-9]*) fail "公网映射端口必须是数字: $PUB_PORT" ;;
+    esac
+    if [ "$PUB_PORT" -lt 1 ] || [ "$PUB_PORT" -gt 65535 ]; then
+      fail "公网映射端口必须在 1-65535 之间: $PUB_PORT"
+    fi
+    ENDPOINT="$PUB_IP:$PUB_PORT"
+    printf '\n'
+    printf '已拼装 endpoint = %s   （映射到本机 UDP %s）\n' "$ENDPOINT" "$lp"
+  fi
+
+  printf '\n'
+  NAME="$(sanitize_name "$NAME")"
+  printf '即将执行：\n'
+  printf '  出口节点设备 : %s\n' "$DEVICE"
+  printf '  出口模式     : %s\n' "$MODE"
+  printf '  客户端名称   : %s\n' "$NAME"
+  printf '  直连公钥     : %s\n' "$CLIENT_PUBLIC_KEY"
+  if [ "$MODE" = "dual" ]; then
+    printf '  WARP 公钥    : %s\n' "$WARP_CLIENT_PUBLIC_KEY"
+  fi
+  printf '  公网 IP      : %s\n' "${ENDPOINT%%:*}"
+  printf '  公网端口     : %s  (NAT 上映射到本机 UDP %s)\n' "${ENDPOINT##*:}" "$(listen_port_hint)"
+  printf '  公网 endpoint: %s\n' "$ENDPOINT"
+  printf '\n确认执行？输入 yes 继续，其他任意键取消：'
+  local answer
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    yes|Yes|YES|y|Y) ;;
+    *)
+      printf '\n已取消，未做任何改动。\n'
+      exit 0
+      ;;
+  esac
+  printf '\n'
+}
+
+print_next_steps() {
+  local key_note="PrivateKey = REPLACE_WITH_YOUR_PRIVATE_KEY"
+  if [ -n "$CLIENT_PRIVATE_KEY" ]; then
+    key_note="PrivateKey 已由本节点生成，直接可用"
+  fi
+  printf '\n'
+  printf '===== 接下来在你电脑上做什么 =====\n'
+  if [ -n "$CLIENT_DIRECT_FILE" ] && [ -r "$CLIENT_DIRECT_FILE" ]; then
+    printf '1. 取配置：%s\n' "$CLIENT_DIRECT_FILE"
+  fi
+  if [ -n "$CLIENT_WARP_FILE" ] && [ -r "$CLIENT_WARP_FILE" ]; then
+    printf '2. 取配置：%s\n' "$CLIENT_WARP_FILE"
+  fi
+  printf '3. %s\n' "$key_note"
+  printf '4. 用 WireGuard for Windows「添加空隧道 → 导入配置」导入\n'
+  printf '5. 启用后在本机执行：curl https://www.cloudflare.com/cdn-cgi/trace\n'
+  printf '   看 ip= 那一行确认出口已经变成目标机房\n'
+
+  if [ "$MODE" = "direct" ]; then
+    printf '\n如果这台电脑还想要 WARP 出口：\n'
+    printf '  再跑一次 wpl-add-client，模式选 2，名称用 %s-warp，用另一组密钥\n' "$NAME"
+  fi
+  if [ "$MODE" = "warp" ]; then
+    printf '\nWARP 转发只处理 TCP，UDP 不会被转发也不会 NAT，会被丢弃。\n'
+    printf '如果这台电脑还想要 UDP 可用的直连出口：\n'
+    printf '  再跑一次 wpl-add-client，模式选 1，名称用 %s-direct，用另一组密钥\n' "${NAME%-warp}"
+  fi
+  if [ "$MODE" = "dual" ]; then
+    printf '\n两份配置 AllowedIPs 都是 0.0.0.0/0，一次只能启用其中一份。\n'
+    printf 'WARP 那份只有 TCP 走 WARP；需要 UDP 时切换到直连那份。\n'
+  fi
+
+  printf '\n回滚命令：\n'
+  printf '  cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$ROLLBACK_BACKUP" "$CONF" "$DEVICE" "$CONF"
+}
+
+rotate_client() {
+  NAME="$(sanitize_name "$NAME")"
+  local state="$CLIENT_STATE_DIR/$NAME.env"
+  [ -r "$state" ] || fail "no managed client named $NAME (see action=list)"
+
+  # Capture the incoming keys BEFORE sourcing the state record: the .env file
+  # overwrites these same globals with the CURRENT values.
+  local new_cpub="$CLIENT_PUBLIC_KEY"
+  local new_wpub="$WARP_CLIENT_PUBLIC_KEY"
+
+  is_public_key "$new_cpub" || fail "client_public_key does not look like a WireGuard public key"
+  if [ -n "$new_wpub" ]; then
+    is_public_key "$new_wpub" || fail "warp_client_public_key does not look like a WireGuard public key"
+  fi
+  load_conf_meta
+
+  local old_cpub old_wpub dip wip mode endpoint created ts backup tmp
+  NAME=""
+  MODE=""
+  CLIENT_PUBLIC_KEY=""
+  CLIENT_IPV4=""
+  WARP_CLIENT_PUBLIC_KEY=""
+  WARP_CLIENT_IPV4=""
+  ENDPOINT=""
+  CREATED_AT=""
+  # shellcheck disable=SC1090
+  . "$state"
+  old_cpub="$CLIENT_PUBLIC_KEY"
+  old_wpub="$WARP_CLIENT_PUBLIC_KEY"
+  dip="$CLIENT_IPV4"
+  wip="$WARP_CLIENT_IPV4"
+  mode="$MODE"
+  endpoint="$ENDPOINT"
+  created="$CREATED_AT"
+
+  log "rotating keys for $NAME (created $created, mode $mode)"
+  log "  old direct key: $old_cpub"
+  log "  new direct key: $new_cpub"
+  if [ -n "$old_wpub" ] && [ -n "$new_wpub" ]; then
+    log "  old warp key  : $old_wpub"
+    log "  new warp key  : $new_wpub"
+  fi
+
+  if [ "$new_cpub" = "$old_cpub" ]; then
+    fail "the new client_public_key is identical to the current one"
+  fi
+  if [ -n "$old_wpub" ] && [ -n "$new_wpub" ] && [ "$new_wpub" = "$old_wpub" ]; then
+    fail "the new warp_client_public_key is identical to the current one"
+  fi
+  if grep -Fxq "PublicKey = $new_cpub" "$CONF"; then
+    fail "the new client_public_key already exists in $CONF"
+  fi
+  if [ -n "$new_wpub" ] && grep -Fxq "PublicKey = $new_wpub" "$CONF"; then
+    fail "the new warp_client_public_key already exists in $CONF"
+  fi
+
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$CONF.bak.$ts"
+  tmp="$(temp_conf_path r)"
+
+  awk -v o1="$old_cpub" -v n1="$new_cpub" \
+      -v o2="$old_wpub" -v n2="$new_wpub" '
+    $0 == "PublicKey = " o1 { print "PublicKey = " n1; rotated++; next }
+    o2 != "" && $0 == "PublicKey = " o2 { print "PublicKey = " n2; rotated++; next }
+    { print }
+    END { exit (rotated == 0) }
+  ' "$CONF" >"$tmp" || fail "the current client key was not found in $CONF; nothing was changed"
+  chmod 0600 "$tmp"
+
+  local expected_hits
+  expected_hits=1
+  if [ -n "$old_wpub" ] && [ -n "$new_wpub" ]; then
+    expected_hits=2
+  fi
+  if [ "$(grep -cF "PublicKey = $new_cpub" "$tmp" || true)" -lt 1 ]; then
+    fail "new direct key missing from rendered config; nothing was changed"
+  fi
+  if [ "$expected_hits" -eq 2 ] && [ "$(grep -cF "PublicKey = $new_wpub" "$tmp" || true)" -lt 1 ]; then
+    fail "new WARP key missing from rendered config; nothing was changed"
+  fi
+  if grep -Fq "$old_cpub" "$tmp"; then
+    fail "old key still present in rendered config; nothing was changed"
+  fi
+
+  local stripped_rot
+  if ! stripped_rot="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "rotated config failed wg-quick validation; nothing was changed"
+  fi
+  if printf '%s\n' "$stripped_rot" |
+    grep -qE '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*='; then
+    fail "rotated config leaks wg-quick-only directives; nothing was changed"
+  fi
+
+  log "rotated config rendered, peer addresses unchanged (direct=${dip:-none} warp=${wip:-none})"
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: stopping before backup and apply"
+    sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
+    return 0
+  fi
+
+  cp -a "$CONF" "$backup"
+  log "backup: $backup"
+  install -m 0600 "$tmp" "$CONF"
+
+  require_command wg
+  if ! wg syncconf "$DEVICE" <(wg-quick strip "$CONF"); then
+    log "syncconf FAILED - restoring $CONF from $backup"
+    cp -a "$backup" "$CONF"
+    fail "hot apply failed; the previous config has been restored, nothing was lost"
+  fi
+  log "hot applied with wg syncconf"
+
+  # Persist the new keys in the client state record.
+  local cpriv wpriv
+  cpriv=""
+  wpriv=""
+  if grep -q '^CLIENT_PRIVATE_KEY=' "$state"; then
+    cpriv="$(grep -m1 '^CLIENT_PRIVATE_KEY=' "$state" | cut -d= -f2- | tr -d "'")"
+  fi
+  if grep -q '^WARP_CLIENT_PRIVATE_KEY=' "$state"; then
+    wpriv="$(grep -m1 '^WARP_CLIENT_PRIVATE_KEY=' "$state" | cut -d= -f2- | tr -d "'")"
+  fi
+  cat >"$state" <<EOF
+NAME='$NAME'
+MODE='$mode'
+CREATED_AT='$created'
+ROTATED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
+CLIENT_PUBLIC_KEY='$new_cpub'
+CLIENT_PRIVATE_KEY='$cpriv'
+CLIENT_IPV4='$dip'
+WARP_CLIENT_PUBLIC_KEY='$new_wpub'
+WARP_CLIENT_PRIVATE_KEY='$wpriv'
+WARP_CLIENT_IPV4='$wip'
+ENDPOINT='$endpoint'
+EOF
+  chmod 0600 "$state"
+
+  # Re-render the exported client configs when this node holds the private key.
+  # The file name and the key both depend on the mode: warp-only writes a single
+  # <name>.conf backed by client_*, dual writes <name>-warp.conf backed by
+  # warp_client_*.
+  local cfg_direct_file="" cfg_warp_file="" cfg_warp_priv="$wpriv"
+  case "$mode" in
+    dual)
+      cfg_direct_file="$CONFIG_DIR/$NAME-direct.conf"
+      cfg_warp_file="$CONFIG_DIR/$NAME-warp.conf"
+      ;;
+    warp)
+      cfg_warp_file="$CONFIG_DIR/$NAME.conf"
+      cfg_warp_priv="$cpriv"
+      ;;
+    *)
+      cfg_direct_file="$CONFIG_DIR/$NAME.conf"
+      ;;
+  esac
+
+  if [ -n "$cpriv" ] && [ -n "$dip" ] && [ -n "$cfg_direct_file" ] && [ -f "$cfg_direct_file" ]; then
+    render_client_config "$dip" "$cpriv" >"$cfg_direct_file"
+    chmod 0600 "$cfg_direct_file"
+    CLIENT_DIRECT_FILE="$cfg_direct_file"
+    log "refreshed client config: $cfg_direct_file"
+  fi
+  if [ -n "$cfg_warp_priv" ] && [ -n "$wip" ] && [ -n "$cfg_warp_file" ] && [ -f "$cfg_warp_file" ]; then
+    render_client_config "$wip" "$cfg_warp_priv" >"$cfg_warp_file"
+    chmod 0600 "$cfg_warp_file"
+    CLIENT_WARP_FILE="$cfg_warp_file"
+    log "refreshed WARP client config: $cfg_warp_file"
+  fi
+
+  printf '\n'
+  printf '===== keys rotated =====\n'
+  printf '  name         : %s\n' "$NAME"
+  printf '  direct addr  : %s   (unchanged)\n' "${dip:-none}"
+  printf '  warp addr    : %s   (unchanged)\n' "${wip:-none}"
+  printf '  new direct pk: %s\n' "$new_cpub"
+  if [ -n "$new_wpub" ]; then
+    printf '  new warp pk  : %s\n' "$new_wpub"
+  fi
+  printf '  rollback     : cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$backup" "$CONF" "$DEVICE" "$CONF"
+  printf '\n  update the client config on your machine with the new public key.\n'
+  printf '  The tunnel drops for a few seconds until the client reconnects with the new key.\n'
+}
+
+# Creates a brand new WireGuard server config on a node that has none, so the
+# node can be used without any main server. The resulting config has no peers;
+# add them afterwards with action=add (or `wpls list wgadd`).
+init_server() {
+  [ -n "$DEVICE" ] || fail "device=<wg-device> is required"
+
+  if [ -e "$CONF" ]; then
+    fail "$CONF already exists; refusing to overwrite it.
+Remove it first if you really want to rebuild this node from scratch, but note
+that this changes the server key and invalidates every existing client config."
+  fi
+
+  local legacy
+  for legacy in /etc/wireguard/*.conf; do
+    [ -e "$legacy" ] || continue
+    log "warning: another WireGuard config already exists: $legacy"
+    log "warning: this node already looks deployed; 'wpls list' will operate on both"
+  done
+
+  require_command wg
+  require_command wg-quick
+  mkdir -p /etc/wireguard
+  chmod 0700 /etc/wireguard
+
+  if [ -z "$LISTEN_PORT" ]; then
+    LISTEN_PORT="51820"
+  fi
+  case "$LISTEN_PORT" in
+    ""|*[!0-9]*) fail "invalid listen_port: $LISTEN_PORT" ;;
+  esac
+  if [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+    fail "listen_port must be between 1 and 65535: $LISTEN_PORT"
+  fi
+  [ -n "$SERVER_ADDR" ] || SERVER_ADDR="10.200.0.1/24"
+
+  if [ -z "$EGRESS" ]; then
+    EGRESS="$(ip route show default 0.0.0.0/0 2>/dev/null |
+      awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  fi
+  [ -n "$EGRESS" ] || fail "cannot detect the egress interface; pass egress=<iface>"
+
+  SERVER_PRIVATE_KEY="$(wg genkey)"
+  SERVER_PUBLIC_KEY="$(printf '%s' "$SERVER_PRIVATE_KEY" | wg pubkey)"
+  [ -n "$SERVER_PUBLIC_KEY" ] || fail "failed to derive the server public key"
+
+  local tmp
+  tmp="$(temp_conf_path i)"
+  {
+    printf '[Interface]\n'
+    printf 'PrivateKey = %s\n' "$SERVER_PRIVATE_KEY"
+    printf 'Address = %s\n' "$SERVER_ADDR"
+    printf 'ListenPort = %s\n' "$LISTEN_PORT"
+    printf 'SaveConfig = false\n'
+    render_hooks ""
+  } >"$tmp.raw"
+  cat -s "$tmp.raw" >"$tmp"
+  rm -f "$tmp.raw"
+  chmod 0600 "$tmp"
+
+  log "new server config rendered: $tmp"
+  printf '\n'
+  sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
+  printf '\n'
+
+  local stripped
+  if ! stripped="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "rendered config failed wg-quick validation; nothing was changed"
+  fi
+  if printf '%s\n' "$stripped" |
+    grep -qE '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*='; then
+    fail "rendered config leaks wg-quick-only directives; nothing was changed"
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: stopping before install and interface start"
+    return 0
+  fi
+
+  install -m 0600 "$tmp" "$CONF"
+  log "installed: $CONF"
+
+  # Prefer systemd so the unit owns the interface from the start. Bringing it up
+  # with a bare `wg-quick up` leaves the unit inactive, and a later
+  # `systemctl start` then fails with "interface already exists".
+  local use_systemd="false"
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    use_systemd="true"
+  fi
+
+  if [ "$use_systemd" = "true" ]; then
+    systemctl enable "wg-quick@$DEVICE" >/dev/null 2>&1 || true
+    install_resilient_dropin "$DEVICE"
+    log "starting interface via systemd: wg-quick@$DEVICE"
+    if ! systemctl start "wg-quick@$DEVICE"; then
+      log "warning: systemctl start failed; falling back to a direct wg-quick up"
+      systemctl status "wg-quick@$DEVICE" --no-pager -n 8 >&2 || true
+      if ip link show "$DEVICE" >/dev/null 2>&1; then
+        log "interface already present; syncing instead"
+        wg syncconf "$DEVICE" <(wg-quick strip "$CONF")
+      else
+        wg-quick up "$DEVICE"
+      fi
+      log "warning: the interface is up but systemd did not start it;"
+      log "warning: run 'systemctl restart wg-quick@$DEVICE' after fixing the unit"
+    fi
+  else
+    log "starting interface: $DEVICE"
+    wg-quick up "$DEVICE"
+  fi
+
+  printf '\n'
+  printf '===== exit node initialized =====\n'
+  printf '  device       : %s\n' "$DEVICE"
+  printf '  server addr  : %s\n' "$SERVER_ADDR"
+  printf '  listen port  : %s\n' "$LISTEN_PORT"
+  printf '  egress iface : %s\n' "$EGRESS"
+  printf '  server pubkey: %s\n' "$SERVER_PUBLIC_KEY"
+  printf '  config       : %s\n' "$CONF"
+  printf '\n'
+  printf '  next: add a client with\n'
+  printf '    wpls list wgadd          (interactive)\n'
+  printf '    or: bash %s action=add device=%s mode=direct name=pc \\\n' "$0" "$DEVICE"
+  printf '        client_public_key=<key> endpoint=<public-ip:port>\n'
+}
+
+# A wg-quick@ unit that fails once at boot (module not loaded yet, iptables not
+# ready) never retries, which is how a whole exit node went dark after a reboot.
+# This drop-in makes it retry until it succeeds.
+install_resilient_dropin() {
+  local dev="$1" dir="${2:-}"
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [ -n "$dir" ] || dir="/etc/systemd/system/wg-quick@$dev.service.d"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: install resilient drop-in in $dir"
+    return 0
+  fi
+  mkdir -p "$dir"
+  cat >"$dir/warppool-resilient.conf" <<'EOF'
+[Unit]
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=20
+ExecStartPre=-/sbin/modprobe wireguard
+EOF
+  chmod 0644 "$dir/warppool-resilient.conf"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log "installed resilient drop-in: $dir/warppool-resilient.conf"
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  local was_interactive="false"
+  if [ "$#" -eq 0 ] || [ "$INTERACTIVE" = "true" ]; then
+    was_interactive="true"
+    log "legacy_add_client.sh $SCRIPT_VERSION"
+    interactive
+  fi
+  validate_args
+  state_paths
+  require_root
+
+  case "$ACTION" in
+    add)
+      add_client
+      if [ "$was_interactive" = "true" ]; then
+        print_next_steps
+      fi
+      ;;
+    init)
+      init_server
+      ;;
+    list)
+      list_clients
+      ;;
+    remove)
+      remove_client
+      ;;
+    rotate)
+      rotate_client
+      ;;
+  esac
+}
+
+main "$@"

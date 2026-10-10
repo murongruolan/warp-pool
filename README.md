@@ -18,6 +18,7 @@ WireGuard-based multi-exit proxy management for small VPS and NAT VPS nodes.
 - [Pull Deployment](#pull-deployment)
 - [Deploy Token](#deploy-token)
 - [Commands](#commands)
+- [Exit Node: Extra Clients](#exit-node-extra-clients)
 - [Configuration](#configuration)
 - [Changelog](#changelog)
 - [Release Process](#release-process)
@@ -566,6 +567,158 @@ curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/
 
 ---
 
+## Exit Node: Extra Clients
+
+Besides main servers, an exit node can accept clients that only need a WireGuard client config and do not run WarpPool: a local PC, a phone, a second admin box.
+
+Which tool manages them depends on the layout the node was deployed with:
+
+| Node layout | WireGuard device | Managed with |
+| --- | --- | --- |
+| Shared (SSH Push deployment) | `wpshared` | `shared_node.sh` |
+| Exclusive (Pull / Deploy Token) | `wp<name>` | `wpls` |
+
+---
+
+### Exclusive layout: `wpls`
+
+The installer puts a connection manager at `/usr/local/bin/wpls`. It is the supported way to add, inspect, change and remove clients on an exclusive-layout node.
+
+```bash
+wpls list
+```
+
+| Command | Description |
+| --- | --- |
+| `wpls init` | Set up a standalone exit node that uses no main server at all |
+| `wpls list` | Show every connection |
+| `wpls list add` | Register a main server (you supply its WireGuard public key) |
+| `wpls list wgadd` | Register a standalone WireGuard device |
+| `wpls list remove [index]` | Delete a connection and its WireGuard config |
+| `wpls list edit` | Change a connection: name, public key, or address |
+| `wpls-update` | Update the node tooling and self-check every installed file |
+| `wpls-update --check` | Self-check only, without downloading anything |
+| `wpls help` | Full reference |
+
+`wpls init` builds the server side from nothing, for a node that should serve as an exit without ever being registered to a main server:
+
+```bash
+# install dependencies first; no token is needed for a standalone node
+bash install.sh mode=dual
+wpls init
+wpls list wgadd
+```
+
+It generates the server keypair, writes `/etc/wireguard/<device>.conf`, starts and enables the interface, and installs a systemd drop-in that retries a failed boot start.
+
+The list shows index, name, type, port, address and live status:
+
+```text
+序号  名称           类型    端口    地址             状态
+1     office-pc      wg      31496   10.200.0.5       在线
+2     <未登记>       未登记  51820   10.200.0.2       在线
+```
+
+Type:
+
+- `wpl` — a main server registered through `wpls list add`
+- `wg` — a standalone device registered through `wpls list wgadd`
+- `未登记` — present in the WireGuard config but never registered through `wpls`; this is how a main server that deployed itself appears
+
+Port is the public port a `wg` client dials, or the node's local listen port for everything else.
+
+Status is read live from the interface:
+
+| Status | Meaning |
+| --- | --- |
+| `在线` | Handshake within the last 3 minutes |
+| `离线` | Has handshaked before, but not recently |
+| `从未握手` | No handshake ever — the client has not connected yet |
+| `不在接口上` | In the config file but missing from the running interface |
+
+`wpls list wgadd` walks through the setup, generating the keypair on the node if you leave the public key blank, and writes an import-ready config to `/root/warppool-clients/`. Leave the port prompts at their defaults unless your NAT mapping differs.
+
+Safety properties, which also apply to `shared_node.sh`:
+
+- Every change is validated with `wg-quick strip` before it touches the config file
+- Changes are applied with `wg syncconf`, so the interface is never brought down and other peers keep their sessions
+- If the apply fails, the previous config is restored automatically
+- `remove` and `edit` act only on connections registered through `wpls`. The main server owns its own peer — remove that one with `warppool node remove` on the main server
+- `edit address` is implemented as a remove followed by a re-add, so that tunnel drops for a few seconds
+- `wpls` refuses to touch `wpshared`; use `shared_node.sh` on a shared node
+
+---
+
+### Shared layout: `shared_node.sh`
+
+Run this on the exit node:
+
+```bash
+# The script is usually already uploaded by Push deployment
+ls -l /tmp/warppool-install/shared_node.sh
+
+# Otherwise download it
+curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/shared_node.sh -o /root/shared_node.sh
+```
+
+#### List every peer
+
+```bash
+bash /root/shared_node.sh action=list
+```
+
+#### Add a client
+
+```bash
+bash /root/shared_node.sh action=add-client \
+  name=pc \
+  mode=direct \
+  endpoint=<exit-node-public-ip>:<nat-mapped-public-udp-port>
+```
+
+One command does four things:
+
+1. Generates the client keypair (supply `client_private_key=<key>` to keep the private key off the exit node)
+2. Appends the peer and hot-reloads the WireGuard interface, leaving existing main-server tunnels untouched
+3. Registers WARP forwarding automatically for `warp` / `dual` mode
+4. Renders a complete, ready-to-import WireGuard client config
+
+Configs are written to `/root/warppool-clients/<name>.conf` and also printed to stdout. Use `config_dir=` to change the directory and `print_config=false` to only write files.
+
+`endpoint=` is the address the **client** dials. On a NAT VPS the auto-detected public IP is correct, but the mapped port cannot be discovered — check your provider's NAT panel and pass the public port, not the node's local `listen_port`.
+
+| Option | Description |
+| --- | --- |
+| `mode=` | `direct` for the node's own egress IP, `warp` for WARP egress, `dual` for both |
+| `allowed_ips=` | Defaults to `0.0.0.0/0, ::/0` (full tunnel); use `10.200.0.0/24` for split tunnel |
+| `dns=` | Defaults to `1.1.1.1, 8.8.8.8` |
+| `config_dir=` | Output directory, defaults to `/root/warppool-clients` |
+| `register_warp=` | Set `false` to skip WARP forwarding registration |
+
+`mode=dual` writes two configs and only one may be active at a time:
+
+```text
+pc.conf       direct egress, UDP works
+pc-warp.conf  WARP egress, TCP only
+```
+
+#### WARP mode limitation
+
+WARP forwarding only redirects **TCP** (`iptables -t nat PREROUTING ... -p tcp -j REDIRECT`). In `warp` mode a client's UDP is neither redirected to WARP nor NATed, so it is dropped.
+
+Use `direct` when you need UDP, or use `dual` to get both tunnels and pick per traffic type.
+
+#### Remove a client
+
+```bash
+bash /root/shared_node.sh action=remove target=pc
+bash /root/shared_node.sh action=remove target=<public-key>   # target by public key instead
+```
+
+Removal re-renders the config, hot-reloads with `wg syncconf`, purges that IP's MASQUERADE rules, and unregisters the WARP forwarding client. Other peers keep their tunnels.
+
+---
+
 ## Configuration
 
 Default config path:
@@ -629,4 +782,7 @@ The script checks the working tree, updates `VERSION`, creates a Chinese commit,
 - No multi-user permission model.
 - No remote Agent.
 - Shared multi-main-server exit-node reuse is currently implemented for SSH Push deployment. Pull / Deploy Token keep the original single-registration flow for now.
+- Extra client access depends on the node layout: `wpls` manages exclusive `wp<name>` nodes, `shared_node.sh action=add-client` manages shared `wpshared` nodes. Neither tool touches the other layout.
+- `wpls list remove` and `wpls list edit` only act on connections registered through `wpls`. Peers that a main server deployed for itself are shown as `未登记` and must be removed from the main server.
+- WARP forwarding redirects TCP only. A `warp`-mode client's UDP is dropped; use `direct`, or `dual` to get both.
 - `upgrade` updates the main binary and bundled installer assets. Existing config is preserved.

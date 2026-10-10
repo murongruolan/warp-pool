@@ -391,6 +391,9 @@ cleanup_global_warppool_state_if_empty() {
     log "skip alias removal, not a symlink: $alias_path"
   fi
   run rm -f /usr/local/bin/warppool-node-uninstall
+  run rm -f /usr/local/bin/wpls
+  run rm -f /usr/local/bin/warppool-node-client
+  run rm -rf /etc/warppool-node/legacy-clients
   run rm -rf /var/lib/warppool/warp-forward
   run rmdir /var/lib/warppool >/dev/null 2>&1 || true
   run rm -rf /usr/local/lib/warppool

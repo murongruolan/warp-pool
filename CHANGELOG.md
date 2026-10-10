@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## v0.1.14
+
+- Added `wpls`, a persistent exit-node connection manager installed at `/usr/local/bin/wpls` by the node installers. It manages clients on exclusive-layout nodes (`wp<name>`) with `wpls list`, `wpls list add`, `wpls list wgadd`, `wpls list remove [index]` and `wpls list edit`. The list merges registered connections with peers that only exist in the WireGuard config, and shows live handshake status.
+- Added `legacy_add_client.sh`, the engine behind `wpls`. It edits an already deployed `wp<name>.conf` in place: existing `PrivateKey`, `Address`, `ListenPort` and every current `[Peer]` block are preserved verbatim, only `PostUp`/`PostDown` are rewritten. It validates with `wg-quick strip`, applies with `wg syncconf`, and restores the previous config automatically if the apply fails.
+- The NAT address list is now embedded directly in `PostUp`/`PostDown` (`for ip in A B; do ... done`) instead of living in an external file. A missing or empty external file used to disable every direct client's MASQUERADE rule silently, which only surfaced after a reboot. Addresses written in the literal form by the Go deploy path are recognised too, and any tunnel address deliberately left out of the list is printed.
+- `legacy_add_client.sh` gained `action=rotate` to swap a client's peer key in place, keeping its tunnel address and NAT rules, and `action=list` / `action=remove`.
+- `legacy_add_client.sh` can now generate the client keypair on the node (`client_private_key=`) and accepts `client_ip=` to pin an address.
+- The public-endpoint hint now queries the node's own public address instead of reusing a peer's `endpoint`, which is the client's address and not the address a new client must dial.
+- Added `shared_node.sh action=add-client` for non-main-server clients (local PC, phone, secondary machines). It appends a peer, hot-reloads the interface without touching existing tunnels, registers WARP forwarding for `warp`/`dual` mode, and renders a ready-to-import full-tunnel WireGuard client config to `/root/warppool-clients`.
+- Added `shared_node.sh action=list` and `shared_node.sh action=remove target=<label|public-key>`. Removal re-renders the config, syncs it live, purges the removed peer's MASQUERADE rules, and unregisters its WARP forwarding client.
+- `shared_node.sh` now records a `NAME` and the optional client private keys per peer, so clients can be re-exported and identified. Existing peers without these fields keep working.
+- Added `warp_forward.sh action=register`, which adds one more client to an already running forwarder without restarting it, falling back to a full startup when no forwarder is running. Manual `shared_node.sh action=add mode=warp` is now self-sufficient instead of requiring the Go deploy path to finish WARP wiring.
+- `shared_node.sh` can now fetch sibling helper scripts from the release URL when they are not next to the script itself.
+- Node uninstallers now also remove `/usr/local/bin/wpls`, `/usr/local/bin/warppool-node-client` and `/etc/warppool-node/legacy-clients`.
+- Added `wpls init`, which sets up an exit node with no main server at all: it generates the server keypair, writes the config, starts and enables the interface, and installs a systemd drop-in that retries a failed boot start. Backed by `legacy_add_client.sh action=init`.
+- The installers now place the runtime helpers (`warp_forward.sh`, `warp_install.sh`, `warp_wgcf.sh`, `singbox_install.sh`, `wg_preflight.sh`) in `/usr/local/lib/warppool/node/`, so nothing has to be fetched at run time and a node can never pull a helper that does not match its installed manager.
+- Fixed `wpls list edit` renaming a connection: it moved the record file but left the `NAME` field inside it, so every later edit failed with "record not found".
+- Fixed `warp`-only mode exporting a client config built from `warp_client_private_key` (which backs the second peer in `dual` mode) instead of the `client_private_key` matching its peer, producing a config that could never connect.
+- No client config is written when no `endpoint` was supplied: the main-server add flow does not ask for one, and the resulting file could not dial anything.
+- Fixed adding a client to a config that has no peers yet (`wpls init` produces exactly that) aborting under `set -o pipefail`.
+- Fixed `wpls init` not handing the interface to systemd, which made a later `systemctl restart` fail and, with the resilient drop-in, retry forever.
+- `wpls list` now uses ASCII type markers (`wpl` / `wg` / `-`); the Chinese label was 6 display columns but 9 bytes, shifting every column after it.
+- Fixed an atomicity gap when adding a WARP client: if WARP forwarding registration failed, the peer was already in the config while no registry record had been written yet, leaving the node inconsistent. A failed registration now restores the previous config and removes the NAT rule it had added, leaving nothing behind.
+- Added `wpls-update`, a persistent command that updates the node tooling and self-checks every file against the downloaded package. It resolves the commit SHA first so a CDN-cached branch tarball cannot install the previous revision.
+
 ## v0.1.12
 
 - Added shared SSH Push exit-node layout. Multiple main servers can now deploy to the same exit node; the node keeps one shared WireGuard device (`wpshared`) and appends peers instead of overwriting existing peers.

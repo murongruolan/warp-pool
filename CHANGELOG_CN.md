@@ -2,6 +2,31 @@
 
 ## 未发布
 
+## v0.1.14
+
+- 新增常驻命令 `wpls`，由节点安装脚本装到 `/usr/local/bin/wpls`，用于管理独占布局节点（`wp<名字>`）上的客户端：`wpls list`、`wpls list add`、`wpls list wgadd`、`wpls list remove [序号]`、`wpls list edit`。列表会把「登记过的连接」和「只存在于 WireGuard 配置里的 peer」合并展示，并显示实时握手状态。
+- 新增 `legacy_add_client.sh`，是 `wpls` 的底层实现。它在已部署的 `wp<名字>.conf` 上就地增量修改：原有 `PrivateKey`、`Address`、`ListenPort` 与全部 `[Peer]` 段逐字保留，只重写 `PostUp`/`PostDown`。写盘前用 `wg-quick strip` 校验，用 `wg syncconf` 热应用，失败自动还原上一份配置。
+- NAT 地址列表改为直接内联在 `PostUp`/`PostDown` 里（`for ip in A B; do ... done`），不再依赖外部文件。此前外部文件一旦丢失或为空，所有直连客户端的 MASQUERADE 规则会被静默跳过，且只有重启后才会暴露。同时识别 Go 部署流程写入的字面地址形式，并会把「故意不在列表内」的隧道地址打印出来。
+- `legacy_add_client.sh` 新增 `action=rotate`，可就地更换客户端的 peer 公钥，隧道地址与 NAT 规则保持不变；另新增 `action=list` 与 `action=remove`。
+- `legacy_add_client.sh` 支持在节点上生成客户端密钥对（`client_private_key=`），并支持用 `client_ip=` 指定地址。
+- 公网端点提示改为查询节点自身的公网地址，不再复用 peer 的 `endpoint`——那是客户端的来源地址，不是新客户端应当拨入的地址。
+- 新增 `shared_node.sh action=add-client`，用于接入非主服务器客户端（本地电脑、手机等）。它会追加 peer、热更新接口而不影响已有隧道、为 `warp`/`dual` 模式注册 WARP 转发，并把可直接导入的全局隧道客户端配置写到 `/root/warppool-clients`。
+- 新增 `shared_node.sh action=list` 和 `shared_node.sh action=remove target=<名称|公钥>`。移除会重渲染配置、同步生效、清理该 peer 的 MASQUERADE 规则，并注销它的 WARP 转发客户端。
+- `shared_node.sh` 现在为每个 peer 记录 `NAME` 和可选的客户端私钥，便于重新导出和识别客户端。已有 peer 缺少这些字段仍然兼容。
+- 新增 `warp_forward.sh action=register`，在转发器已经运行时直接追加客户端而不重启；没有转发器运行时回退到完整启动流程。手动执行 `shared_node.sh action=add mode=warp` 现在自成一体，不再依赖 Go 部署流程补 WARP 接线。
+- `shared_node.sh` 在同目录缺少配套脚本时，可以从发布地址自动下载。
+- 节点卸载脚本现在会一并清理 `/usr/local/bin/wpls`、`/usr/local/bin/warppool-node-client` 与 `/etc/warppool-node/legacy-clients`。
+- 新增 `wpls init`：在没有主服务器的情况下初始化出口节点（生成服务端密钥、写配置、启动接口、装开机自愈）。配套的 `legacy_add_client.sh action=init` 让"不配置主服务器、只当出口用"成为可行路径。
+- 安装脚本会把运行期需要的 helper（`warp_forward.sh`、`warp_install.sh`、`warp_wgcf.sh`、`singbox_install.sh`、`wg_preflight.sh`）装到 `/usr/local/lib/warppool/node/`，运行期不再需要联网下载，避免出现"节点版本与拉取的 helper 版本不匹配"。
+- 修复 `wpls list edit` 改名只移动文件、未同步记录内的 `NAME` 字段，导致改名之后所有后续编辑都报"找不到登记文件"。
+- 修复 `warp` 单隧道模式导出的客户端配置使用了 `warp_client_private_key`（那是 dual 模式第二条隧道用的），与 peer 的 `client_public_key` 不是一对密钥，客户端无法连接。
+- 未提供 `endpoint` 时不再生成客户端配置（添加主服务器时那份配置本就无法拨号，是个空壳）。
+- 修复配置中还没有任何 peer 时（`wpls init` 刚建好）添加客户端会因 `set -o pipefail` 中断。
+- 修复 `wpls init` 未把接口交给 systemd 管理，导致之后 `systemctl restart` 必然失败并因自愈策略无限重试。
+- `wpls list` 的类型列改用 ASCII 标记（`wpl` / `wg` / `-`），修正中文因字节数与显示宽度不一致造成的列错位。
+- 修复添加 WARP 客户端时的原子性缺口：WARP 转发注册（`warp_forward.sh action=register`）失败时，peer 已经写入配置，但登记记录尚未生成，节点会停在「有 peer、没记录」的不一致状态。现在注册失败会把配置回滚到改动前并清除已加的 NAT 规则，什么都不留下。
+- 新增常驻命令 `wpls-update`：一条命令更新节点工具集，并逐项自检安装结果。它先解析出提交号再下载，避免按分支名下载时命中 CDN 缓存装成上一个版本。
+
 ## v0.1.12
 
 - 新增 SSH Push 共享出口节点布局。多台主服务器可以部署到同一个出口节点；出口节点只维护一个共享 WireGuard 设备 `wpshared`，后续部署会追加 peer，不再覆盖已有 peer。

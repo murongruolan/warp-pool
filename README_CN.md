@@ -18,6 +18,7 @@
 - [Pull 部署](#pull-部署)
 - [Deploy Token](#deploy-token)
 - [常用命令](#常用命令)
+- [出口节点：接入额外客户端](#出口节点接入额外客户端)
 - [配置](#配置)
 - [更新日志](#更新日志)
 - [安全说明](#安全说明)
@@ -537,6 +538,160 @@ curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/
 
 ---
 
+## 出口节点：接入额外客户端
+
+出口节点除了主服务器，还可以接入本地电脑、手机等**不安装 WarpPool** 的客户端：它们只需要一条 WireGuard 客户端配置。
+
+用哪个工具取决于节点当初的部署方式：
+
+| 节点布局 | WireGuard 设备 | 使用工具 |
+| --- | --- | --- |
+| 共享布局（SSH Push 部署） | `wpshared` | `shared_node.sh` |
+| 独占布局（Pull / Deploy Token 部署） | `wp<名字>` | `wpls` |
+
+---
+
+### 独占布局：`wpls`
+
+安装脚本会装一个常驻命令到 `/usr/local/bin/wpls`，这是独占布局下管理客户端的标准方式。
+
+```bash
+wpls list
+```
+
+| 命令 | 说明 |
+| --- | --- |
+| `wpls init` | 初始化一个完全不用主服务器的独立出口节点 |
+| `wpls list` | 查看本地连接列表 |
+| `wpls list add` | 添加一台主服务器（由你提供它的 WireGuard 公钥） |
+| `wpls list wgadd` | 添加一台独立 WireGuard 设备 |
+| `wpls list remove [序号]` | 删除指定连接及其 WireGuard 配置 |
+| `wpls list edit` | 修改连接：名称 / 公钥 / 地址 |
+| `wpls-update` | 更新节点工具集，并逐项自检已安装文件 |
+| `wpls-update --check` | 只自检，不下载 |
+| `wpls help` | 完整帮助 |
+
+`wpls init` 从零建出服务端，适用于「只当出口用、不接入任何主服务器」的节点：
+
+```bash
+# 先装依赖；独立节点不需要 token
+bash install.sh mode=dual
+wpls init
+wpls list wgadd
+```
+
+它会生成服务端密钥对、写 `/etc/wireguard/<设备名>.conf`、启动并启用接口，同时装上开机自愈的 systemd drop-in。
+
+列表会显示序号、名称、类型、端口、地址和实时状态：
+
+```text
+序号  名称           类型    端口    地址             状态
+1     office-pc      wg      31496   10.200.0.5       在线
+2     <未登记>       未登记  51820   10.200.0.2       在线
+```
+
+类型含义：
+
+- `wpl` —— 通过 `wpls list add` 登记的主服务器
+- `wg` —— 通过 `wpls list wgadd` 登记的独立设备
+- `未登记` —— 存在于 WireGuard 配置里、但没经过 `wpls` 登记；主服务器自行部署的 peer 就显示成这样
+
+端口一栏，`wg` 类型显示客户端实际拨入的公网端口，其余显示节点本机监听端口。
+
+状态是实时从接口读取的：
+
+| 状态 | 含义 |
+| --- | --- |
+| `在线` | 最近 3 分钟内有握手 |
+| `离线` | 曾经握过手，但已经不活跃 |
+| `从未握手` | 一次都没握手过——客户端还没连上 |
+| `不在接口上` | 配置里有，但运行中的接口上没有这个 peer |
+
+`wpls list wgadd` 会走一遍交互向导。公钥留空则由节点生成密钥对，并把可直接导入的配置写到 `/root/warppool-clients/`。端口提示直接用默认值即可，除非你的 NAT 映射不同。
+
+以下安全性质对 `shared_node.sh` 同样适用：
+
+- 每次改动都先用 `wg-quick strip` 校验，通过后才写配置文件
+- 用 `wg syncconf` 热更新，接口不重启，其他 peer 的会话不受影响
+- 应用失败会自动还原上一份配置
+- `remove` 和 `edit` 只作用于经过 `wpls` 登记的连接。主服务器的 peer 归它自己管，请在主服务器上执行 `warppool node remove`
+- `edit` 改地址是"移除 + 重建"两步，该隧道会中断几秒
+- `wpls` 拒绝操作 `wpshared`，共享节点请改用 `shared_node.sh`
+
+---
+
+### 共享布局：`shared_node.sh`
+
+在出口节点上直接执行：
+
+```bash
+# 查看脚本是否在节点上
+ls -l /tmp/warppool-install/shared_node.sh
+
+# 没有就下载
+curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/shared_node.sh -o /root/shared_node.sh
+```
+
+#### 列出所有 peer
+
+```bash
+bash /root/shared_node.sh action=list
+```
+
+#### 新增一个客户端
+
+```bash
+bash /root/shared_node.sh action=add-client \
+  name=pc \
+  mode=direct \
+  endpoint=<出口节点公网IP>:<NAT映射后的公网UDP端口>
+```
+
+命令会完成四件事：
+
+1. 生成客户端密钥对（也可以用 `client_private_key=<key>` 自带私钥，公私钥分离更安全）
+2. 追加 peer 并热更新 WireGuard 接口，不影响已有主服务器隧道
+3. `warp` / `dual` 模式自动注册 WARP 转发
+4. 生成可直接导入的完整客户端配置
+
+输出配置默认写到 `/root/warppool-clients/<name>.conf`，也直接打印到终端。用 `config_dir=` 换目录，用 `print_config=false` 只写文件不打印。
+
+`endpoint=` 是**客户端要连的地址**。NAT VPS 上自动探测到的公网 IP 是正确的，但**映射端口探测不到**——请查服务商的 NAT 面板，填公网端口，而不是节点本机的 `listen_port`。
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `mode=` | `direct` 走子服务器本机出口；`warp` 走 WARP 出口；`dual` 同时生成两条隧道 |
+| `allowed_ips=` | 默认 `0.0.0.0/0, ::/0`（全局隧道）；只想访问内网可改成 `10.200.0.0/24` |
+| `dns=` | 默认 `1.1.1.1, 8.8.8.8` |
+| `config_dir=` | 配置输出目录，默认 `/root/warppool-clients` |
+| `register_warp=` | `false` 时跳过 WARP 转发注册 |
+
+`mode=dual` 会生成两份配置，**一次只能启用一条**：
+
+```text
+pc.conf       直连出口，UDP 可用
+pc-warp.conf  WARP 出口，仅 TCP
+```
+
+#### WARP 模式的限制
+
+WARP 转发只重定向 **TCP**（`iptables -t nat PREROUTING ... -p tcp -j REDIRECT`）。`warp` 模式下该客户端的 UDP 不会被转发到 WARP，也不做 NAT，会被丢弃。
+
+需要 UDP 就用 `direct`，或者用 `dual` 拿到两条隧道分开用。
+
+#### 移除客户端
+
+```bash
+bash /root/shared_node.sh action=remove target=pc
+bash /root/shared_node.sh action=remove target=<公钥>   # 也可以用公钥定位
+```
+
+移除会重渲染配置、`wg syncconf` 热更新、清理该 IP 的 MASQUERADE 规则，并在 WARP 模式下注销转发客户端。其它 peer 的隧道不受影响。
+
+---
+
 ## 配置
 
 默认配置路径：
@@ -571,4 +726,7 @@ curl -fsSL https://raw.githubusercontent.com/murongruolan/warp-pool/main/assets/
 
 - 没有 Web UI。
 - 共享多主服务器复用同一出口节点目前先支持 SSH Push 部署；Pull / Deploy Token 暂时保持原有单次注册流程。
+- 额外客户端接入按节点布局区分：`wpls` 管理独占 `wp<名字>` 节点，`shared_node.sh action=add-client` 管理共享 `wpshared` 节点，两个工具都不碰对方的布局。
+- `wpls list remove` 与 `wpls list edit` 只作用于经过 `wpls` 登记的连接。主服务器自行部署的 peer 显示为 `未登记`，需要在主服务器上移除。
+- WARP 转发只处理 TCP。`warp` 模式客户端的 UDP 会被丢弃；需要 UDP 请用 `direct`，或 `dual` 同时拿两条隧道。
 - `upgrade` 会更新主程序二进制和内置安装脚本资源，但不会修改现有配置文件。
