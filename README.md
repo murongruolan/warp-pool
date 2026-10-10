@@ -590,12 +590,26 @@ wpls list
 
 | Command | Description |
 | --- | --- |
+| `wpls init` | Set up a standalone exit node that uses no main server at all |
 | `wpls list` | Show every connection |
 | `wpls list add` | Register a main server (you supply its WireGuard public key) |
 | `wpls list wgadd` | Register a standalone WireGuard device |
 | `wpls list remove [index]` | Delete a connection and its WireGuard config |
 | `wpls list edit` | Change a connection: name, public key, or address |
+| `wpls-update` | Update the node tooling and self-check every installed file |
+| `wpls-update --check` | Self-check only, without downloading anything |
 | `wpls help` | Full reference |
+
+`wpls init` builds the server side from nothing, for a node that should serve as an exit without ever being registered to a main server:
+
+```bash
+# install dependencies first; no token is needed for a standalone node
+bash install.sh mode=dual
+wpls init
+wpls list wgadd
+```
+
+It generates the server keypair, writes `/etc/wireguard/<device>.conf`, starts and enables the interface, and installs a systemd drop-in that retries a failed boot start.
 
 The list shows index, name, type, port, address and live status:
 

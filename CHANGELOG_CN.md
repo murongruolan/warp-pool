@@ -2,6 +2,8 @@
 
 ## 未发布
 
+## v0.1.14
+
 - 新增常驻命令 `wpls`，由节点安装脚本装到 `/usr/local/bin/wpls`，用于管理独占布局节点（`wp<名字>`）上的客户端：`wpls list`、`wpls list add`、`wpls list wgadd`、`wpls list remove [序号]`、`wpls list edit`。列表会把「登记过的连接」和「只存在于 WireGuard 配置里的 peer」合并展示，并显示实时握手状态。
 - 新增 `legacy_add_client.sh`，是 `wpls` 的底层实现。它在已部署的 `wp<名字>.conf` 上就地增量修改：原有 `PrivateKey`、`Address`、`ListenPort` 与全部 `[Peer]` 段逐字保留，只重写 `PostUp`/`PostDown`。写盘前用 `wg-quick strip` 校验，用 `wg syncconf` 热应用，失败自动还原上一份配置。
 - NAT 地址列表改为直接内联在 `PostUp`/`PostDown` 里（`for ip in A B; do ... done`），不再依赖外部文件。此前外部文件一旦丢失或为空，所有直连客户端的 MASQUERADE 规则会被静默跳过，且只有重启后才会暴露。同时识别 Go 部署流程写入的字面地址形式，并会把「故意不在列表内」的隧道地址打印出来。
@@ -23,6 +25,7 @@
 - 修复 `wpls init` 未把接口交给 systemd 管理，导致之后 `systemctl restart` 必然失败并因自愈策略无限重试。
 - `wpls list` 的类型列改用 ASCII 标记（`wpl` / `wg` / `-`），修正中文因字节数与显示宽度不一致造成的列错位。
 - 修复添加 WARP 客户端时的原子性缺口：WARP 转发注册（`warp_forward.sh action=register`）失败时，peer 已经写入配置，但登记记录尚未生成，节点会停在「有 peer、没记录」的不一致状态。现在注册失败会把配置回滚到改动前并清除已加的 NAT 规则，什么都不留下。
+- 新增常驻命令 `wpls-update`：一条命令更新节点工具集，并逐项自检安装结果。它先解析出提交号再下载，避免按分支名下载时命中 CDN 缓存装成上一个版本。
 
 ## v0.1.12
 

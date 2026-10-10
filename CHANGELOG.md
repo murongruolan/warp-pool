@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.14
+
 - Added `wpls`, a persistent exit-node connection manager installed at `/usr/local/bin/wpls` by the node installers. It manages clients on exclusive-layout nodes (`wp<name>`) with `wpls list`, `wpls list add`, `wpls list wgadd`, `wpls list remove [index]` and `wpls list edit`. The list merges registered connections with peers that only exist in the WireGuard config, and shows live handshake status.
 - Added `legacy_add_client.sh`, the engine behind `wpls`. It edits an already deployed `wp<name>.conf` in place: existing `PrivateKey`, `Address`, `ListenPort` and every current `[Peer]` block are preserved verbatim, only `PostUp`/`PostDown` are rewritten. It validates with `wg-quick strip`, applies with `wg syncconf`, and restores the previous config automatically if the apply fails.
 - The NAT address list is now embedded directly in `PostUp`/`PostDown` (`for ip in A B; do ... done`) instead of living in an external file. A missing or empty external file used to disable every direct client's MASQUERADE rule silently, which only surfaced after a reboot. Addresses written in the literal form by the Go deploy path are recognised too, and any tunnel address deliberately left out of the list is printed.
@@ -23,6 +25,7 @@
 - Fixed `wpls init` not handing the interface to systemd, which made a later `systemctl restart` fail and, with the resilient drop-in, retry forever.
 - `wpls list` now uses ASCII type markers (`wpl` / `wg` / `-`); the Chinese label was 6 display columns but 9 bytes, shifting every column after it.
 - Fixed an atomicity gap when adding a WARP client: if WARP forwarding registration failed, the peer was already in the config while no registry record had been written yet, leaving the node inconsistent. A failed registration now restores the previous config and removes the NAT rule it had added, leaving nothing behind.
+- Added `wpls-update`, a persistent command that updates the node tooling and self-checks every file against the downloaded package. It resolves the commit SHA first so a CDN-cached branch tarball cannot install the previous revision.
 
 ## v0.1.12
 

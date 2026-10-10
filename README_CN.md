@@ -561,12 +561,26 @@ wpls list
 
 | 命令 | 说明 |
 | --- | --- |
+| `wpls init` | 初始化一个完全不用主服务器的独立出口节点 |
 | `wpls list` | 查看本地连接列表 |
 | `wpls list add` | 添加一台主服务器（由你提供它的 WireGuard 公钥） |
 | `wpls list wgadd` | 添加一台独立 WireGuard 设备 |
 | `wpls list remove [序号]` | 删除指定连接及其 WireGuard 配置 |
 | `wpls list edit` | 修改连接：名称 / 公钥 / 地址 |
+| `wpls-update` | 更新节点工具集，并逐项自检已安装文件 |
+| `wpls-update --check` | 只自检，不下载 |
 | `wpls help` | 完整帮助 |
+
+`wpls init` 从零建出服务端，适用于「只当出口用、不接入任何主服务器」的节点：
+
+```bash
+# 先装依赖；独立节点不需要 token
+bash install.sh mode=dual
+wpls init
+wpls list wgadd
+```
+
+它会生成服务端密钥对、写 `/etc/wireguard/<设备名>.conf`、启动并启用接口，同时装上开机自愈的 systemd drop-in。
 
 列表会显示序号、名称、类型、端口、地址和实时状态：
 
