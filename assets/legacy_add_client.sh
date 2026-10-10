@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r11"
+SCRIPT_VERSION="2026.10.10-r12"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -329,12 +329,27 @@ unregister_warp_client() {
 }
 
 render_hooks() {
-  cat <<'HOOKS' | sed \
-    -e "s|__NATFILE__|$NAT_V4_FILE|g" \
-    -e "s|__EGRESS__|$EGRESS|g"
-PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT; iptables -C FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; if [ -r __NATFILE__ ]; then while read ip; do [ -n "$ip" ] || continue; iptables -t nat -C POSTROUTING -s "$ip/32" -o __EGRESS__ -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$ip/32" -o __EGRESS__ -j MASQUERADE; done < __NATFILE__; fi
-PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; if [ -r __NATFILE__ ]; then while read ip; do [ -n "$ip" ] || continue; iptables -t nat -D POSTROUTING -s "$ip/32" -o __EGRESS__ -j MASQUERADE 2>/dev/null || true; done < __NATFILE__; fi
-HOOKS
+  local addr_list="$1"
+  local nat_up="" nat_down=""
+  if [ -n "$addr_list" ]; then
+    nat_up="; for ip in $addr_list; do iptables -t nat -C POSTROUTING -s \"\$ip/32\" -o $EGRESS -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s \"\$ip/32\" -o $EGRESS -j MASQUERADE; done"
+    nat_down="; for ip in $addr_list; do iptables -t nat -D POSTROUTING -s \"\$ip/32\" -o $EGRESS -j MASQUERADE 2>/dev/null || true; done"
+  fi
+  printf 'PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -C FORWARD -i %%i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %%i -j ACCEPT; iptables -C FORWARD -o %%i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %%i -m state --state RELATED,ESTABLISHED -j ACCEPT%s\n' "$nat_up"
+  printf 'PostDown = iptables -D FORWARD -i %%i -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o %%i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true%s\n' "$nat_down"
+}
+
+# The NAT address list is embedded in PostUp/PostDown ("for ip in A B; do"),
+# so the config file is the single source of truth and no external file has to
+# survive a reboot. This also reads the legacy external-file form so existing
+# deployments migrate on their next add/remove.
+read_nat_addresses() {
+  {
+    sed -n 's/.*for ip in \([^;]*\); do.*/\1/p' "$CONF" 2>/dev/null | tr ' ' '\n'
+    if [ -r "$NAT_V4_FILE" ]; then
+      cat "$NAT_V4_FILE"
+    fi
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u || true
 }
 
 render_peer() {
@@ -410,37 +425,25 @@ add_client() {
   ts="$(date +%Y%m%d-%H%M%S)"
   backup="$CONF.bak.$ts"
 
-  # 1. NAT address list. This is the union of three sources so an entry can
-  #    never be lost:
-  #      - the list that is already on disk
-  #      - addresses recovered from a still-literal PostUp in the config
-  #      - the address just allocated for this client
-  #    Parsing the config alone is not enough: the first run rewrites PostUp
-  #    into a loop over this very file, so from then on it carries no literal
-  #    address and parsing it alone would silently truncate the list.
+  # 1. NAT address list. Union of whatever the config already carries (inline
+  #    in PostUp, or the legacy external file) and the address just allocated.
+  #    The result is embedded into the new PostUp, so the config file becomes
+  #    the single source of truth and nothing outside it has to survive a
+  #    reboot.
   mkdir -p "$CLIENT_STATE_DIR"
   chmod 0700 "$CLIENT_STATE_DIR"
-  local seeded
-  seeded="$(sed -n 's/.*POSTROUTING -s \([0-9.]*\)\/32 -o [^ ]* -j MASQUERADE.*/\1/p' "$CONF" || true)"
-  {
-    if [ -r "$NAT_V4_FILE" ]; then
-      cat "$NAT_V4_FILE"
-    fi
-    if [ -n "$seeded" ]; then
-      printf '%s\n' "$seeded"
-    fi
+  local nat_list
+  nat_list="$({
+    read_nat_addresses
     if [ -n "$direct_ip" ]; then
       printf '%s\n' "$direct_ip"
     fi
-  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u >"$NAT_V4_FILE.new" || :
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
 
-  if [ ! -s "$NAT_V4_FILE.new" ]; then
-    rm -f "$NAT_V4_FILE.new"
-    fail "the NAT address list would become empty; refusing to proceed because every direct peer would lose its MASQUERADE rule. Restore $NAT_V4_FILE before retrying."
+  if [ -z "$nat_list" ]; then
+    fail "the NAT address list would become empty; refusing to proceed because every direct peer would lose its MASQUERADE rule. Inspect $CONF before retrying."
   fi
-  mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
-  chmod 0600 "$NAT_V4_FILE"
-  log "NAT address list: $(tr '\n' ' ' <"$NAT_V4_FILE")"
+  log "NAT address list embedded into PostUp: $nat_list"
 
   # 2. Render the new config. The Interface section is rebuilt explicitly so
   #    that SaveConfig and the PostUp/PostDown hooks stay INSIDE the section:
@@ -467,7 +470,7 @@ add_client() {
     sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/Address = /'
     sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/ListenPort = /'
     printf 'SaveConfig = %s\n' "$save_config"
-    render_hooks
+    render_hooks "$nat_list"
     printf '\n'
     sed -n '/^[[:space:]]*\[Peer\]/,$p' "$CONF"
     render_peer "$CLIENT_PUBLIC_KEY" "$primary_ip"
@@ -519,14 +522,14 @@ add_client() {
   fi
   log "hot applied with wg syncconf"
 
-  # 5. NAT rules for the new direct client (PostUp only runs on interface start).
-  if [ -n "$direct_ip" ] && [ "$MODE" != "warp" ]; then
-    while read -r ip; do
-      [ -n "$ip" ] || continue
+  # 5. NAT rules for every direct client (PostUp only runs on interface start,
+  #    so reconcile now from the list just embedded into the config).
+  if [ -n "$nat_list" ]; then
+    for ip in $nat_list; do
       iptables -t nat -C POSTROUTING -s "$ip/32" -o "$EGRESS" -j MASQUERADE 2>/dev/null \
         || iptables -t nat -A POSTROUTING -s "$ip/32" -o "$EGRESS" -j MASQUERADE
-    done <"$NAT_V4_FILE"
-    log "MASQUERADE rules reconciled from $NAT_V4_FILE"
+    done
+    log "MASQUERADE rules reconciled for: $nat_list"
   fi
 
   # 6. WARP forwarding for the new warp client.
@@ -690,6 +693,30 @@ remove_client() {
     { printf "%s\n\n", $0 }
   ' "$CONF" >"$tmp"
 
+  # Drop the removed address from the inline NAT list in PostUp/PostDown.
+  # Computed from $CONF, which is still the pre-removal file at this point.
+  if [ -n "$dip" ]; then
+    local new_nat
+    new_nat="$(read_nat_addresses | grep -vxF "$dip" | tr '\n' ' ' | sed 's/ *$//' || true)"
+    if ! awk -v addrs="$new_nat" '
+        /^(PostUp|PostDown) = / {
+          if (addrs == "") {
+            sub(/; for ip in .*; done/, "")
+          } else {
+            sub(/for ip in [^;]*; do/, "for ip in " addrs "; do")
+          }
+          print
+          next
+        }
+        { print }
+      ' "$tmp" >"$tmp.hooks"; then
+      rm -f "$tmp.hooks"
+      fail "failed to rewrite the NAT address list in the rendered config; nothing was changed"
+    fi
+    mv "$tmp.hooks" "$tmp"
+    log "NAT address list after removal: ${new_nat:-<empty, NAT loop dropped>}"
+  fi
+
   # Guard against a paragraph-mode surprise wiping unrelated peers.
   local before after expected
   before="$(grep -c '^[[:space:]]*\[Peer\]' "$CONF" || true)"
@@ -726,16 +753,18 @@ remove_client() {
   fi
   log "hot applied removal"
 
-  if [ -n "$dip" ] && [ -r "$NAT_V4_FILE" ]; then
+  if [ -n "$dip" ]; then
     while iptables -t nat -C POSTROUTING -s "${dip}/32" -o "$EGRESS" -j MASQUERADE >/dev/null 2>&1; do
       run iptables -t nat -D POSTROUTING -s "${dip}/32" -o "$EGRESS" -j MASQUERADE
     done
-    grep -vxF "$dip" "$NAT_V4_FILE" >"$NAT_V4_FILE.new" || :
-    if [ -s "$NAT_V4_FILE.new" ]; then
-      mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
-    else
-      rm -f "$NAT_V4_FILE.new"
-      log "warning: refusing to empty the NAT address list; $dip left in $NAT_V4_FILE"
+    # Keep the legacy external file in sync if a deployment still has one.
+    if [ -r "$NAT_V4_FILE" ]; then
+      grep -vxF "$dip" "$NAT_V4_FILE" >"$NAT_V4_FILE.new" || :
+      if [ -s "$NAT_V4_FILE.new" ]; then
+        mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
+      else
+        rm -f "$NAT_V4_FILE.new"
+      fi
     fi
   fi
 
