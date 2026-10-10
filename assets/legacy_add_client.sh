@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r10"
+SCRIPT_VERSION="2026.10.10-r11"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -410,20 +410,37 @@ add_client() {
   ts="$(date +%Y%m%d-%H%M%S)"
   backup="$CONF.bak.$ts"
 
-  # 1. NAT address file, seeded from the rules already present in the config so
-  #    the existing main server keeps its MASQUERADE rule.
+  # 1. NAT address list. This is the union of three sources so an entry can
+  #    never be lost:
+  #      - the list that is already on disk
+  #      - addresses recovered from a still-literal PostUp in the config
+  #      - the address just allocated for this client
+  #    Parsing the config alone is not enough: the first run rewrites PostUp
+  #    into a loop over this very file, so from then on it carries no literal
+  #    address and parsing it alone would silently truncate the list.
   mkdir -p "$CLIENT_STATE_DIR"
   chmod 0700 "$CLIENT_STATE_DIR"
   local seeded
-  seeded="$(sed -n 's/.*POSTROUTING -s \([0-9.]*\)\/32 -o [^ ]* -j MASQUERADE.*/\1/p' "$CONF")"
-  if [ -n "$seeded" ]; then
-    printf '%s\n' "$seeded" >"$NAT_V4_FILE.seed"
-  else
-    : >"$NAT_V4_FILE.seed"
+  seeded="$(sed -n 's/.*POSTROUTING -s \([0-9.]*\)\/32 -o [^ ]* -j MASQUERADE.*/\1/p' "$CONF" || true)"
+  {
+    if [ -r "$NAT_V4_FILE" ]; then
+      cat "$NAT_V4_FILE"
+    fi
+    if [ -n "$seeded" ]; then
+      printf '%s\n' "$seeded"
+    fi
+    if [ -n "$direct_ip" ]; then
+      printf '%s\n' "$direct_ip"
+    fi
+  } | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u >"$NAT_V4_FILE.new" || :
+
+  if [ ! -s "$NAT_V4_FILE.new" ]; then
+    rm -f "$NAT_V4_FILE.new"
+    fail "the NAT address list would become empty; refusing to proceed because every direct peer would lose its MASQUERADE rule. Restore $NAT_V4_FILE before retrying."
   fi
-  if [ -n "$direct_ip" ]; then
-    printf '%s\n' "$direct_ip" >>"$NAT_V4_FILE.seed"
-  fi
+  mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
+  chmod 0600 "$NAT_V4_FILE"
+  log "NAT address list: $(tr '\n' ' ' <"$NAT_V4_FILE")"
 
   # 2. Render the new config. The Interface section is rebuilt explicitly so
   #    that SaveConfig and the PostUp/PostDown hooks stay INSIDE the section:
@@ -487,10 +504,6 @@ add_client() {
   cp -a "$CONF" "$backup"
   log "backup: $backup"
   ROLLBACK_BACKUP="$backup"
-
-  sort -u -o "$NAT_V4_FILE" "$NAT_V4_FILE.seed"
-  rm -f "$NAT_V4_FILE.seed"
-  chmod 0600 "$NAT_V4_FILE"
 
   install -m 0600 "$tmp" "$CONF"
   log "installed: $CONF"
@@ -717,8 +730,13 @@ remove_client() {
     while iptables -t nat -C POSTROUTING -s "${dip}/32" -o "$EGRESS" -j MASQUERADE >/dev/null 2>&1; do
       run iptables -t nat -D POSTROUTING -s "${dip}/32" -o "$EGRESS" -j MASQUERADE
     done
-    grep -vxF "$dip" "$NAT_V4_FILE" >"$NAT_V4_FILE.new" || true
-    mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
+    grep -vxF "$dip" "$NAT_V4_FILE" >"$NAT_V4_FILE.new" || :
+    if [ -s "$NAT_V4_FILE.new" ]; then
+      mv "$NAT_V4_FILE.new" "$NAT_V4_FILE"
+    else
+      rm -f "$NAT_V4_FILE.new"
+      log "warning: refusing to empty the NAT address list; $dip left in $NAT_V4_FILE"
+    fi
   fi
 
   if [ "$REGISTER_WARP" = "true" ] && [ -n "$wip" ]; then
