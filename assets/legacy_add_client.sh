@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r6"
+SCRIPT_VERSION="2026.10.10-r7"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -85,6 +85,12 @@ Usage:
 
   bash legacy_add_client.sh action=list device=wp2-1
   bash legacy_add_client.sh action=remove device=wp2-1 name=<label>
+  bash legacy_add_client.sh action=rotate device=wp2-1 name=<label> \
+      client_public_key=<new-key> [warp_client_public_key=<new-key>] [--dry-run]
+
+action=rotate swaps a managed client's peer key in place. The tunnel address,
+the NAT rules and every other peer stay exactly as they are; only the
+PublicKey line changes.
 
 Adds a peer to an already deployed legacy exclusive config in place. The
 existing PrivateKey, Address, ListenPort and every current [Peer] block are
@@ -143,8 +149,8 @@ validate_bool() {
 
 validate_args() {
   case "$ACTION" in
-    add|list|remove) ;;
-    *) fail "unsupported action: $ACTION, expected add, list, or remove" ;;
+    add|list|remove|rotate) ;;
+    *) fail "unsupported action: $ACTION, expected add, list, remove, or rotate" ;;
   esac
   case "$MODE" in
     direct|warp|dual) ;;
@@ -172,6 +178,10 @@ validate_args() {
   fi
   if [ "$ACTION" = "remove" ]; then
     [ -n "$NAME" ] || fail "name=<label> is required"
+  fi
+  if [ "$ACTION" = "rotate" ]; then
+    [ -n "$NAME" ] || fail "name=<label> is required"
+    [ -n "$CLIENT_PUBLIC_KEY" ] || fail "client_public_key=<new-key> is required"
   fi
 }
 
@@ -958,6 +968,165 @@ print_next_steps() {
   printf '  cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$ROLLBACK_BACKUP" "$CONF" "$DEVICE" "$CONF"
 }
 
+rotate_client() {
+  NAME="$(sanitize_name "$NAME")"
+  local state="$CLIENT_STATE_DIR/$NAME.env"
+  [ -r "$state" ] || fail "no managed client named $NAME (see action=list)"
+  is_public_key "$CLIENT_PUBLIC_KEY" || fail "client_public_key does not look like a WireGuard public key"
+  load_conf_meta
+
+  local old_cpub old_wpub dip wip mode endpoint created ts backup tmp
+  NAME=""
+  MODE=""
+  CLIENT_PUBLIC_KEY=""
+  CLIENT_IPV4=""
+  WARP_CLIENT_PUBLIC_KEY=""
+  WARP_CLIENT_IPV4=""
+  ENDPOINT=""
+  CREATED_AT=""
+  # shellcheck disable=SC1090
+  . "$state"
+  old_cpub="$CLIENT_PUBLIC_KEY"
+  old_wpub="$WARP_CLIENT_PUBLIC_KEY"
+  dip="$CLIENT_IPV4"
+  wip="$WARP_CLIENT_IPV4"
+  mode="$MODE"
+  endpoint="$ENDPOINT"
+  created="$CREATED_AT"
+
+  log "rotating keys for $NAME (created $created, mode $mode)"
+  log "  old direct key: $old_cpub"
+  log "  new direct key: $CLIENT_PUBLIC_KEY"
+  if [ -n "$old_wpub" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+    log "  old warp key  : $old_wpub"
+    log "  new warp key  : $WARP_CLIENT_PUBLIC_KEY"
+  fi
+
+  if [ "$CLIENT_PUBLIC_KEY" = "$old_cpub" ]; then
+    fail "the new client_public_key is identical to the current one"
+  fi
+  if [ -n "$old_wpub" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ] && [ "$WARP_CLIENT_PUBLIC_KEY" = "$old_wpub" ]; then
+    fail "the new warp_client_public_key is identical to the current one"
+  fi
+  if grep -Fxq "PublicKey = $CLIENT_PUBLIC_KEY" "$CONF"; then
+    fail "the new client_public_key already exists in $CONF"
+  fi
+  if [ -n "$WARP_CLIENT_PUBLIC_KEY" ] && grep -Fxq "PublicKey = $WARP_CLIENT_PUBLIC_KEY" "$CONF"; then
+    fail "the new warp_client_public_key already exists in $CONF"
+  fi
+
+  ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$CONF.bak.$ts"
+  tmp="/tmp/$DEVICE.rotate.$$.conf"
+
+  awk -v o1="$old_cpub" -v n1="$CLIENT_PUBLIC_KEY" \
+      -v o2="$old_wpub" -v n2="$WARP_CLIENT_PUBLIC_KEY" '
+    $0 == "PublicKey = " o1 { print "PublicKey = " n1; rotated++; next }
+    o2 != "" && $0 == "PublicKey = " o2 { print "PublicKey = " n2; rotated++; next }
+    { print }
+    END { exit (rotated == 0) }
+  ' "$CONF" >"$tmp" || fail "the current client key was not found in $CONF; nothing was changed"
+  chmod 0600 "$tmp"
+
+  local expected_hits
+  expected_hits=1
+  if [ -n "$old_wpub" ] && [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+    expected_hits=2
+  fi
+  if [ "$(grep -cF "PublicKey = $CLIENT_PUBLIC_KEY" "$tmp" || true)" -lt 1 ]; then
+    fail "new direct key missing from rendered config; nothing was changed"
+  fi
+  if [ "$expected_hits" -eq 2 ] && [ "$(grep -cF "PublicKey = $WARP_CLIENT_PUBLIC_KEY" "$tmp" || true)" -lt 1 ]; then
+    fail "new WARP key missing from rendered config; nothing was changed"
+  fi
+  if grep -Fq "$old_cpub" "$tmp"; then
+    fail "old key still present in rendered config; nothing was changed"
+  fi
+
+  local stripped_rot
+  if ! stripped_rot="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "rotated config failed wg-quick validation; nothing was changed"
+  fi
+  if printf '%s\n' "$stripped_rot" |
+    grep -qE '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*='; then
+    fail "rotated config leaks wg-quick-only directives; nothing was changed"
+  fi
+
+  log "rotated config rendered, peer addresses unchanged (direct=${dip:-none} warp=${wip:-none})"
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: stopping before backup and apply"
+    sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
+    return 0
+  fi
+
+  cp -a "$CONF" "$backup"
+  log "backup: $backup"
+  install -m 0600 "$tmp" "$CONF"
+
+  require_command wg
+  if ! wg syncconf "$DEVICE" <(wg-quick strip "$CONF"); then
+    log "syncconf FAILED - restoring $CONF from $backup"
+    cp -a "$backup" "$CONF"
+    fail "hot apply failed; the previous config has been restored, nothing was lost"
+  fi
+  log "hot applied with wg syncconf"
+
+  # Persist the new keys in the client state record.
+  local cpriv wpriv
+  cpriv=""
+  wpriv=""
+  if grep -q '^CLIENT_PRIVATE_KEY=' "$state"; then
+    cpriv="$(grep -m1 '^CLIENT_PRIVATE_KEY=' "$state" | cut -d= -f2- | tr -d "'")"
+  fi
+  if grep -q '^WARP_CLIENT_PRIVATE_KEY=' "$state"; then
+    wpriv="$(grep -m1 '^WARP_CLIENT_PRIVATE_KEY=' "$state" | cut -d= -f2- | tr -d "'")"
+  fi
+  cat >"$state" <<EOF
+NAME='$NAME'
+MODE='$mode'
+CREATED_AT='$created'
+ROTATED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
+CLIENT_PUBLIC_KEY='$CLIENT_PUBLIC_KEY'
+CLIENT_PRIVATE_KEY='$cpriv'
+CLIENT_IPV4='$dip'
+WARP_CLIENT_PUBLIC_KEY='$WARP_CLIENT_PUBLIC_KEY'
+WARP_CLIENT_PRIVATE_KEY='$wpriv'
+WARP_CLIENT_IPV4='$wip'
+ENDPOINT='$endpoint'
+EOF
+  chmod 0600 "$state"
+
+  # Re-render the client config when this node holds the private key.
+  local cfg_dir_file
+  cfg_dir_file="$CONFIG_DIR/$NAME.conf"
+  if [ -n "$cpriv" ] && [ -n "$dip" ] && [ -f "$cfg_dir_file" ]; then
+    render_client_config "$dip" "$cpriv" >"$cfg_dir_file"
+    chmod 0600 "$cfg_dir_file"
+    CLIENT_DIRECT_FILE="$cfg_dir_file"
+    log "refreshed client config: $cfg_dir_file"
+  fi
+  if [ -n "$wpriv" ] && [ -n "$wip" ] && [ -f "$CONFIG_DIR/$NAME-warp.conf" ]; then
+    render_client_config "$wip" "$wpriv" >"$CONFIG_DIR/$NAME-warp.conf"
+    chmod 0600 "$CONFIG_DIR/$NAME-warp.conf"
+    CLIENT_WARP_FILE="$CONFIG_DIR/$NAME-warp.conf"
+    log "refreshed WARP client config: $CONFIG_DIR/$NAME-warp.conf"
+  fi
+
+  printf '\n'
+  printf '===== keys rotated =====\n'
+  printf '  name         : %s\n' "$NAME"
+  printf '  direct addr  : %s   (unchanged)\n' "${dip:-none}"
+  printf '  warp addr    : %s   (unchanged)\n' "${wip:-none}"
+  printf '  new direct pk: %s\n' "$CLIENT_PUBLIC_KEY"
+  if [ -n "$WARP_CLIENT_PUBLIC_KEY" ]; then
+    printf '  new warp pk  : %s\n' "$WARP_CLIENT_PUBLIC_KEY"
+  fi
+  printf '  rollback     : cp %s %s && wg syncconf %s <(wg-quick strip %s)\n' "$backup" "$CONF" "$DEVICE" "$CONF"
+  printf '\n  update the client config on your machine with the new public key.\n'
+  printf '  The tunnel drops for a few seconds until the client reconnects with the new key.\n'
+}
+
 main() {
   parse_args "$@"
   require_root
@@ -983,6 +1152,9 @@ main() {
       ;;
     remove)
       remove_client
+      ;;
+    rotate)
+      rotate_client
       ;;
   esac
 }
