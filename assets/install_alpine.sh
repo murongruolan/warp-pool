@@ -135,7 +135,7 @@ install_node_uninstaller() {
 }
 
 install_wpls() {
-  local dir cli helper
+  local dir cli helper node_dir name f
   dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
   cli="$dir/wpls.sh"
@@ -155,6 +155,21 @@ install_wpls() {
   else
     log "warning: exit node client helper not found: $helper"
   fi
+
+  # Helpers the connection manager invokes at runtime. Keeping them on disk means
+  # it never has to fetch them from the release URL, which is how a node
+  # installed from an older release ended up running a helper that did not
+  # support the action it was called with.
+  node_dir="/usr/local/lib/warppool/node"
+  run mkdir -p "$node_dir"
+  for name in warp_forward.sh warp_install.sh warp_wgcf.sh singbox_install.sh wg_preflight.sh; do
+    f="$dir/$name"
+    if [ -r "$f" ]; then
+      run cp "$f" "$node_dir/$name"
+      run chmod 0755 "$node_dir/$name"
+    fi
+  done
+  log "installed node helper scripts: $node_dir"
 }
 
 maybe_install_warp() {

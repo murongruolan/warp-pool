@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_VERSION="2026.10.11-r5"
+WPLS_VERSION="2026.10.11-r6"
 
 # wpls - WarpPool exit-node connection manager.
 #
@@ -385,14 +385,17 @@ build_view() {
 
 print_view() {
   hr
-  printf '%s\n' "序号  名称           类型    端口    地址             状态"
+  # Chinese labels are double width but triple bytes, so the header is spelled
+  # out with explicit spaces rather than relying on printf padding.
+  printf '%s\n' "序号  名称           类型        端口    地址             状态"
   hr
   if [ "${VIEW_COUNT:-0}" -eq 0 ]; then
     printf '%s\n' "  （还没有任何连接）"
     hr
     return 0
   fi
-  awk -F'\t' '{ printf "%-4s  %-13s  %-6s  %-6s  %-15s  %s\n", $1, $2, $3, $4, $5, $6 }' "$VIEW_FILE"
+  # The type column is padded to 10 so the 9-byte label 未登记 lines up with wg/wpl.
+  awk -F'\t' '{ printf "%-4s  %-13s  %-10s  %-6s  %-15s  %s\n", $1, $2, $3, $4, $5, $6 }' "$VIEW_FILE"
   hr
 }
 
@@ -441,16 +444,24 @@ warp_available() {
 
 # Downloads a sibling asset from the release URL and runs it, so a node that was
 # installed dependency-only can still get WARP without re-running the installer.
+# Anything already on disk wins: fetching at run time can hand back a helper that
+# does not match the installed wpls.
 fetch_and_run_asset() {
   local name="$1"
   shift
-  local dir target
+  local dir candidate target
   dir="$(script_dir)"
-  target="$dir/$name"
-  if [ -r "$target" ]; then
-    bash "$target" "$@"
-    return $?
-  fi
+  for candidate in \
+    "$dir/$name" \
+    "/usr/local/lib/warppool/node/$name" \
+    "/root/$name" \
+    "/tmp/warppool-install/$name"
+  do
+    if [ -r "$candidate" ]; then
+      bash "$candidate" "$@"
+      return $?
+    fi
+  done
   if ! command -v curl >/dev/null 2>&1; then
     fail "需要 curl 才能下载 $name"
   fi

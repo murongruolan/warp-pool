@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r19"
+SCRIPT_VERSION="2026.10.10-r20"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -245,13 +245,23 @@ download_script() {
 
 helper_path() {
   local name="$1"
-  local dir local_path
+  local dir candidate
   dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-  local_path="$dir/$name"
-  if [ -r "$local_path" ]; then
-    printf '%s\n' "$local_path"
-    return 0
-  fi
+  # Prefer anything already on disk. Fetching from the release URL at run time
+  # is the last resort: a node installed from an older release would otherwise
+  # pull a mismatched helper (that is how `action=register` went missing).
+  for candidate in \
+    "$dir/$name" \
+    "/usr/local/lib/warppool/node/$name" \
+    "/root/$name" \
+    "/tmp/warppool-install/$name" \
+    "/tmp/warppool-mode/$name"
+  do
+    if [ -r "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
   mkdir -p "$DOWNLOAD_DIR"
   download_script "$name" "$DOWNLOAD_DIR/$name"
   printf '%s\n' "$DOWNLOAD_DIR/$name"
@@ -619,7 +629,7 @@ add_client() {
   chmod 0700 "$CONFIG_DIR"
   CLIENT_DIRECT_FILE=""
   CLIENT_WARP_FILE=""
-  local direct_file warp_file
+  local direct_file="" warp_file=""
   case "$MODE" in
     dual)
       direct_file="$CONFIG_DIR/$NAME-direct.conf"
@@ -638,7 +648,14 @@ add_client() {
     CLIENT_DIRECT_FILE="$direct_file"
   fi
   if [ -n "$warp_ip" ] && [ -n "$warp_file" ]; then
-    render_client_config "$warp_ip" "$WARP_CLIENT_PRIVATE_KEY" >"$warp_file"
+    # In warp-only mode the single peer IS client_public_key, so its config must
+    # carry client_private_key. warp_client_* only backs the second peer in dual
+    # mode; using it here produced a config whose key did not match its peer.
+    local warp_priv="$CLIENT_PRIVATE_KEY"
+    if [ "$MODE" = "dual" ]; then
+      warp_priv="$WARP_CLIENT_PRIVATE_KEY"
+    fi
+    render_client_config "$warp_ip" "$warp_priv" >"$warp_file"
     chmod 0600 "$warp_file"
     CLIENT_WARP_FILE="$warp_file"
   fi
@@ -1249,20 +1266,36 @@ ENDPOINT='$endpoint'
 EOF
   chmod 0600 "$state"
 
-  # Re-render the client config when this node holds the private key.
-  local cfg_dir_file
-  cfg_dir_file="$CONFIG_DIR/$NAME.conf"
-  if [ -n "$cpriv" ] && [ -n "$dip" ] && [ -f "$cfg_dir_file" ]; then
-    render_client_config "$dip" "$cpriv" >"$cfg_dir_file"
-    chmod 0600 "$cfg_dir_file"
-    CLIENT_DIRECT_FILE="$cfg_dir_file"
-    log "refreshed client config: $cfg_dir_file"
+  # Re-render the exported client configs when this node holds the private key.
+  # The file name and the key both depend on the mode: warp-only writes a single
+  # <name>.conf backed by client_*, dual writes <name>-warp.conf backed by
+  # warp_client_*.
+  local cfg_direct_file="" cfg_warp_file="" cfg_warp_priv="$wpriv"
+  case "$mode" in
+    dual)
+      cfg_direct_file="$CONFIG_DIR/$NAME-direct.conf"
+      cfg_warp_file="$CONFIG_DIR/$NAME-warp.conf"
+      ;;
+    warp)
+      cfg_warp_file="$CONFIG_DIR/$NAME.conf"
+      cfg_warp_priv="$cpriv"
+      ;;
+    *)
+      cfg_direct_file="$CONFIG_DIR/$NAME.conf"
+      ;;
+  esac
+
+  if [ -n "$cpriv" ] && [ -n "$dip" ] && [ -n "$cfg_direct_file" ] && [ -f "$cfg_direct_file" ]; then
+    render_client_config "$dip" "$cpriv" >"$cfg_direct_file"
+    chmod 0600 "$cfg_direct_file"
+    CLIENT_DIRECT_FILE="$cfg_direct_file"
+    log "refreshed client config: $cfg_direct_file"
   fi
-  if [ -n "$wpriv" ] && [ -n "$wip" ] && [ -f "$CONFIG_DIR/$NAME-warp.conf" ]; then
-    render_client_config "$wip" "$wpriv" >"$CONFIG_DIR/$NAME-warp.conf"
-    chmod 0600 "$CONFIG_DIR/$NAME-warp.conf"
-    CLIENT_WARP_FILE="$CONFIG_DIR/$NAME-warp.conf"
-    log "refreshed WARP client config: $CONFIG_DIR/$NAME-warp.conf"
+  if [ -n "$cfg_warp_priv" ] && [ -n "$wip" ] && [ -n "$cfg_warp_file" ] && [ -f "$cfg_warp_file" ]; then
+    render_client_config "$wip" "$cfg_warp_priv" >"$cfg_warp_file"
+    chmod 0600 "$cfg_warp_file"
+    CLIENT_WARP_FILE="$cfg_warp_file"
+    log "refreshed WARP client config: $cfg_warp_file"
   fi
 
   printf '\n'
