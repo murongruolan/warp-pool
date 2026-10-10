@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r12"
+SCRIPT_VERSION="2026.10.10-r13"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -17,6 +17,7 @@ WARP_CLIENT_PUBLIC_KEY=""
 CLIENT_PRIVATE_KEY=""
 WARP_CLIENT_PRIVATE_KEY=""
 ENDPOINT=""
+CLIENT_IP_OVERRIDE=""
 EGRESS=""
 ALLOWED_IPS="0.0.0.0/0, ::/0"
 CLIENT_DNS="1.1.1.1, 8.8.8.8"
@@ -128,6 +129,7 @@ parse_args() {
       client_private_key=*) CLIENT_PRIVATE_KEY="${arg#client_private_key=}" ;;
       warp_client_private_key=*) WARP_CLIENT_PRIVATE_KEY="${arg#warp_client_private_key=}" ;;
       endpoint=*) ENDPOINT="${arg#endpoint=}" ;;
+      client_ip=*|address=*) CLIENT_IP_OVERRIDE="${arg#*=}" ;;
       egress=*) EGRESS="${arg#egress=}" ;;
       allowed_ips=*) ALLOWED_IPS="${arg#allowed_ips=}" ;;
       dns=*) CLIENT_DNS="${arg#dns=}" ;;
@@ -398,20 +400,39 @@ add_client() {
   RESERVED_IPS=""
   case "$MODE" in
     direct)
-      allocate_ip
-      direct_ip="$ALLOCATED_IP"
+      if [ -n "$CLIENT_IP_OVERRIDE" ]; then
+        direct_ip="$CLIENT_IP_OVERRIDE"
+      else
+        allocate_ip
+        direct_ip="$ALLOCATED_IP"
+      fi
       ;;
     warp)
-      allocate_ip
-      warp_ip="$ALLOCATED_IP"
+      if [ -n "$CLIENT_IP_OVERRIDE" ]; then
+        warp_ip="$CLIENT_IP_OVERRIDE"
+      else
+        allocate_ip
+        warp_ip="$ALLOCATED_IP"
+      fi
       ;;
     dual)
-      allocate_ip
-      direct_ip="$ALLOCATED_IP"
+      if [ -n "$CLIENT_IP_OVERRIDE" ]; then
+        direct_ip="$CLIENT_IP_OVERRIDE"
+      else
+        allocate_ip
+        direct_ip="$ALLOCATED_IP"
+      fi
       allocate_ip
       warp_ip="$ALLOCATED_IP"
       ;;
   esac
+  if [ -n "$direct_ip" ]; then
+    case "$direct_ip" in
+      *[!0-9.]*|"") fail "invalid client_ip: $direct_ip" ;;
+    esac
+    RESERVED_IPS="${RESERVED_IPS:+$RESERVED_IPS
+}$direct_ip"
+  fi
   if [ -n "$direct_ip" ]; then
     primary_ip="$direct_ip"
   else

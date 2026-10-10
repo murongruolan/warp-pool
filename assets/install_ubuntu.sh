@@ -214,6 +214,29 @@ install_node_uninstaller() {
   log "installed node uninstall alias: /usr/local/bin/wpl-node-uninstall"
 }
 
+install_wpls() {
+  local dir cli helper
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+  cli="$dir/wpls.sh"
+  if [ -r "$cli" ]; then
+    run cp "$cli" /usr/local/bin/wpls
+    run chmod 0755 /usr/local/bin/wpls
+    log "installed exit node connection manager: /usr/local/bin/wpls"
+  else
+    log "warning: exit node connection manager not found: $cli"
+  fi
+
+  helper="$dir/legacy_add_client.sh"
+  if [ -r "$helper" ]; then
+    run cp "$helper" /usr/local/bin/warppool-node-client
+    run chmod 0755 /usr/local/bin/warppool-node-client
+    log "installed exit node client helper: /usr/local/bin/warppool-node-client"
+  else
+    log "warning: exit node client helper not found: $helper"
+  fi
+}
+
 maybe_install_warp() {
   if [ "$MODE" = "direct" ]; then
     log "direct mode selected, skipping Cloudflare WARP installation"
@@ -499,6 +522,7 @@ main() {
   log_wireguard_ready
   check_wireguard_kernel_support
   install_node_uninstaller
+  install_wpls
   fetch_registration_info
   maybe_install_warp
   register_node
