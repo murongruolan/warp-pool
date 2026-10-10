@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_UPDATE_VERSION="2026.10.11-r2"
+WPLS_UPDATE_VERSION="2026.10.11-r3"
 
 # Updates the exit-node tooling on an already installed node.
 #
@@ -13,7 +13,9 @@ WPLS_UPDATE_VERSION="2026.10.11-r2"
 # how an update silently installed the previous revision.
 
 REPO="${WARPPOOL_REPO:-murongruolan/warp-pool}"
-BRANCH="${WARPPOOL_BRANCH:-developer}"
+# Default to main: a node in production must not silently pick up unreleased
+# code. Test a branch on purpose with WARPPOOL_BRANCH=developer.
+BRANCH="${WARPPOOL_BRANCH:-main}"
 WORK="/tmp/warppool-update.$$"
 BIN_DIR="/usr/local/bin"
 NODE_LIB="/usr/local/lib/warppool/node"
@@ -194,7 +196,7 @@ wpls-update - 更新出口节点上的 wpls 工具集  (${WPLS_UPDATE_VERSION})
 
 环境变量:
   WARPPOOL_REPO    默认 $REPO
-  WARPPOOL_BRANCH  默认 $BRANCH
+  WARPPOOL_BRANCH  默认 $BRANCH（测试未发布代码时设为 developer）
 
 只写入 /usr/local，不触碰 /etc/wireguard、iptables 与 systemd 状态，
 可在正在承载流量的节点上安全执行。
