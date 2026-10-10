@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r13"
+SCRIPT_VERSION="2026.10.10-r14"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -857,20 +857,22 @@ listen_port_hint() {
     head -n 1 | tr -d '[:space:]'
 }
 
-# On a 1:1 NAT VPS every client reaches the node from the same public address,
-# so the most frequent peer endpoint is a good guess for it.
+# A peer's endpoint is the address the CLIENT connects FROM. On a NAT host that
+# is the intermediate's address, not the address clients must dial — using it as
+# a hint would suggest the main server's own IP. Ask an external service for
+# this node's public address instead; on a 1:1 NAT VPS that returns exactly the
+# address clients reach the node on.
 guess_public_ip() {
   local ip=""
-  if command -v wg >/dev/null 2>&1; then
-    ip="$(wg show "$DEVICE" endpoints 2>/dev/null |
-      awk '{print $2}' |
-      sed 's/^\[//; s/\]:.*//; s/:.*//' |
-      grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' |
-      sort | uniq -c | sort -rn | head -n 1 | awk '{print $2}')"
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
   fi
-  if [ -z "$ip" ]; then
-    ip="$(last_known_endpoint | head -n 1 | sed 's/^\[//; s/\]:.*//; s/:.*//')"
+  if [ -z "$ip" ] && command -v wget >/dev/null 2>&1; then
+    ip="$(wget -qO- -T 8 https://api.ipify.org 2>/dev/null || true)"
   fi
+  case "$ip" in
+    *[!0-9.]*|"") ip="" ;;
+  esac
   printf '%s' "$ip"
 }
 

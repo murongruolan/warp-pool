@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_VERSION="2026.10.11-r1"
+WPLS_VERSION="2026.10.11-r2"
 
 # wpls - WarpPool exit-node connection manager.
 #
@@ -157,6 +157,18 @@ is_public_key() {
   [ "${#1}" -eq 44 ] && [ "${1: -1}" = "=" ]
 }
 
+# Sets GEN_PRIV / GEN_PUB. legacy_add_client.sh has no "generate for me" mode,
+# so the keypair is produced here and both halves are passed on: the public half
+# becomes the peer, the private half is written into the exported client config.
+GEN_PRIV=""
+GEN_PUB=""
+gen_keypair() {
+  command -v wg >/dev/null 2>&1 || fail "需要 wg 命令生成密钥，请先安装 wireguard-tools"
+  GEN_PRIV="$(wg genkey)"
+  GEN_PUB="$(printf '%s' "$GEN_PRIV" | wg pubkey)"
+  [ -n "$GEN_PUB" ] || fail "生成密钥对失败"
+}
+
 all_devices() {
   local f
   for f in "$STATE_BASE"/*.conf; do
@@ -280,6 +292,23 @@ port_of() {
   p="$(listen_port_of "$dev")"
   [ -n "$p" ] || p="-"
   printf '%s\n' "$p"
+}
+
+# A peer's endpoint is the address the client connects FROM, so it is NOT the
+# address a new client must dial. Ask an external service for this node's own
+# public address; on a 1:1 NAT VPS that is exactly the dial address.
+guess_public_ip() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  if [ -z "$ip" ] && command -v wget >/dev/null 2>&1; then
+    ip="$(wget -qO- -T 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  case "$ip" in
+    *[!0-9.]*|"") ip="" ;;
+  esac
+  printf '%s' "$ip"
 }
 
 kind_label() {
@@ -447,7 +476,7 @@ cmd_add() {
 }
 
 cmd_wgadd() {
-  local dev name mode pub pub_ip pub_port endpoint
+  local dev name mode pub pub_ip pub_port endpoint cpriv wpub wpriv
   dev="$(detect_device)"
   info ""
   info "添加一台独立 WireGuard 设备：只要本节点的出口流量，不安装 wpl。"
@@ -469,6 +498,27 @@ cmd_wgadd() {
   ask pub "客户端公钥（44 字符；直接回车则由本节点生成密钥对）" ""
   if [ -n "$pub" ]; then
     is_public_key "$pub" || fail "公钥格式不对（应 44 字符且以 = 结尾）"
+    if [ "$mode" = "dual" ]; then
+      ask wpub "第二条（WARP 隧道）公钥（必须与上面不同；直接回车则由本节点生成）" ""
+      if [ -n "$wpub" ]; then
+        is_public_key "$wpub" || fail "公钥格式不对（应 44 字符且以 = 结尾）"
+        [ "$wpub" = "$pub" ] && fail "两条隧道不能用同一个公钥"
+      fi
+    fi
+  fi
+
+  # Fill in whatever was left blank. Done before the summary so the values shown
+  # are the ones actually used.
+  cpriv=""; wpriv=""
+  if [ -z "$pub" ]; then
+    gen_keypair
+    cpriv="$GEN_PRIV"; pub="$GEN_PUB"
+    log "已在本节点生成密钥对，私钥会直接写进客户端配置"
+  fi
+  if [ "$mode" = "dual" ] && [ -z "$wpub" ]; then
+    gen_keypair
+    wpriv="$GEN_PRIV"; wpub="$GEN_PUB"
+    log "已在本节点生成第二条（WARP）密钥对"
   fi
 
   local lp ip_hint port_hint
@@ -481,14 +531,18 @@ cmd_wgadd() {
   fi
   info ""
 
-  ip_hint="$(wg show "$dev" endpoints 2>/dev/null |
-    awk '{print $2}' | sed 's/^\[//; s/\]:.*//; s/:.*//' |
-    grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort | uniq -c | sort -rn |
-    head -n 1 | awk '{print $2}' || true)"
+  ip_hint="$(guess_public_ip)"
   port_hint="$(grep -h '^ENDPOINT=' "$CLIENT_ROOT"/*/*.env 2>/dev/null |
     head -n 1 | cut -d= -f2- | tr -d "'" | awk -F: '{print $NF}' || true)"
 
-  ask pub_ip "公网 IP（NAT 机器对外的地址）" "$ip_hint"
+  if [ -n "$ip_hint" ]; then
+    info "本节点探测到的公网地址: $ip_hint"
+  else
+    info "探测不到本节点公网地址，请手动填写。"
+  fi
+  info "注意：这里要填的是【本节点】对外的地址，不是主服务器的地址。"
+  info ""
+  ask pub_ip "公网 IP（本节点对外地址）" "$ip_hint"
   ask pub_port "公网映射端口（NAT 上的外部端口）" "$port_hint"
   [ -n "$pub_ip" ] || fail "公网 IP 不能为空"
   case "$pub_port" in
@@ -505,13 +559,19 @@ cmd_wgadd() {
   info "  名称         : $name"
   info "  类型         : wg（独立设备）"
   info "  出口模式     : $mode"
-  info "  客户端公钥   : ${pub:-<由本节点生成密钥对>}"
+  info "  客户端公钥   : $pub"
+  if [ -n "$wpub" ]; then
+    info "  WARP 公钥    : $wpub"
+  fi
   info "  公网 endpoint: $endpoint"
   info ""
   confirm "确认添加" || { info "已取消，未做任何改动。"; return 0; }
 
-  local args=(action=add "device=$dev" "mode=$mode" "name=$name" "endpoint=$endpoint")
-  [ -n "$pub" ] && args+=("client_public_key=$pub")
+  local args=(action=add "device=$dev" "mode=$mode" "name=$name"
+              "endpoint=$endpoint" "client_public_key=$pub")
+  [ -n "$cpriv" ] && args+=("client_private_key=$cpriv")
+  [ -n "$wpub" ] && args+=("warp_client_public_key=$wpub")
+  [ -n "$wpriv" ] && args+=("warp_client_private_key=$wpriv")
   run_helper "${args[@]}"
 
   augment_record "$dev" "$name" "wg" "$pub_port"
