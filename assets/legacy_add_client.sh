@@ -26,6 +26,8 @@ DRY_RUN="false"
 INTERACTIVE="false"
 MODE_SET="false"
 MODE_CHOICE=""
+PUB_IP=""
+PUB_PORT=""
 CLIENT_DIRECT_FILE=""
 CLIENT_WARP_FILE=""
 ROLLBACK_BACKUP=""
@@ -706,6 +708,32 @@ last_known_endpoint() {
   done
 }
 
+listen_port_hint() {
+  sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null |
+    head -n 1 | tr -d '[:space:]'
+}
+
+# On a 1:1 NAT VPS every client reaches the node from the same public address,
+# so the most frequent peer endpoint is a good guess for it.
+guess_public_ip() {
+  local ip=""
+  if command -v wg >/dev/null 2>&1; then
+    ip="$(wg show "$DEVICE" endpoints 2>/dev/null |
+      awk '{print $2}' |
+      sed 's/^\[//; s/\]:.*//; s/:.*//' |
+      grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' |
+      sort | uniq -c | sort -rn | head -n 1 | awk '{print $2}')"
+  fi
+  if [ -z "$ip" ]; then
+    ip="$(last_known_endpoint | head -n 1 | sed 's/^\[//; s/\]:.*//; s/:.*//')"
+  fi
+  printf '%s' "$ip"
+}
+
+last_known_port() {
+  last_known_endpoint | head -n 1 | awk -F: '{print $NF}'
+}
+
 interactive() {
   ACTION="add"
   install_shortcut
@@ -791,12 +819,32 @@ interactive() {
   fi
 
   if [ -z "$ENDPOINT" ]; then
-    local hint
-    hint="$(last_known_endpoint)"
-    prompt ENDPOINT "客户端要连接的公网 endpoint（NAT 映射后的 地址:端口）" "$hint"
-  fi
-  if [ -z "$ENDPOINT" ]; then
-    fail "endpoint is required"
+    local lp ip_hint port_hint
+    lp="$(listen_port_hint)"
+    [ -n "$lp" ] || lp="51820"
+    ip_hint="$(guess_public_ip)"
+    port_hint="$(last_known_port)"
+    printf '\n'
+    printf '出口节点 %s 在本机监听 UDP %s\n' "$DEVICE" "$lp"
+    printf 'NAT 上需要有一条 公网端口 -> 本机 %s 的 UDP 映射，客户端连的就是这条映射\n' "$lp"
+    printf '（主服务器用的就是这条映射，请填相同的公网端口）\n\n'
+    prompt PUB_IP "公网 IP（NAT 机器对外的地址）" "$ip_hint"
+    prompt PUB_PORT "公网映射端口（NAT 上的外部端口）" "$port_hint"
+    if [ -z "$PUB_IP" ]; then
+      fail "公网 IP 不能为空"
+    fi
+    if [ -z "$PUB_PORT" ]; then
+      fail "公网映射端口不能为空"
+    fi
+    case "$PUB_PORT" in
+      ""|*[!0-9]*) fail "公网映射端口必须是数字: $PUB_PORT" ;;
+    esac
+    if [ "$PUB_PORT" -lt 1 ] || [ "$PUB_PORT" -gt 65535 ]; then
+      fail "公网映射端口必须在 1-65535 之间: $PUB_PORT"
+    fi
+    ENDPOINT="$PUB_IP:$PUB_PORT"
+    printf '\n'
+    printf '已拼装 endpoint = %s   （映射到本机 UDP %s）\n' "$ENDPOINT" "$lp"
   fi
 
   printf '\n'
@@ -806,9 +854,11 @@ interactive() {
   printf '  出口模式     : %s\n' "$MODE"
   printf '  客户端名称   : %s\n' "$NAME"
   printf '  直连公钥     : %s\n' "$CLIENT_PUBLIC_KEY"
-  if [ "$MODE" = "dual" ] || [ "$MODE" = "warp" ]; then
+  if [ "$MODE" = "dual" ]; then
     printf '  WARP 公钥    : %s\n' "$WARP_CLIENT_PUBLIC_KEY"
   fi
+  printf '  公网 IP      : %s\n' "${ENDPOINT%%:*}"
+  printf '  公网端口     : %s  (NAT 上映射到本机 UDP %s)\n' "${ENDPOINT##*:}" "$(listen_port_hint)"
   printf '  公网 endpoint: %s\n' "$ENDPOINT"
   printf '\n确认执行？输入 yes 继续，其他任意键取消：'
   local answer
