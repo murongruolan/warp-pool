@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-WPLS_VERSION="2026.10.11-r4"
+WPLS_VERSION="2026.10.11-r5"
 
 # wpls - WarpPool exit-node connection manager.
 #
@@ -52,6 +52,7 @@ usage() {
 wpls - WarpPool 出口节点连接管理  (${WPLS_VERSION})
 
 用法:
+  wpls init                     初始化一个独立出口节点（不依赖主服务器）
   wpls list                     查看本地连接列表
   wpls list add                 添加一台主服务器（对方运行 wpl 主服务器端）
   wpls list wgadd               添加一台独立 WireGuard 设备（只用本节点出口，不装 wpl）
@@ -59,6 +60,17 @@ wpls - WarpPool 出口节点连接管理  (${WPLS_VERSION})
   wpls list edit                修改连接信息（名称 / 公钥 / 地址）
   wpls help                     显示本帮助
   wpls version                  显示版本
+
+初始化独立节点:
+  全新机器上先装依赖（含 WARP 与 wpls），不需要 token：
+
+    bash install.sh mode=dual
+
+  然后建服务端配置：
+
+    wpls init
+
+  之后用 wpls list wgadd 加客户端即可，全程不需要主服务器。
 
 列表字段:
 
@@ -420,6 +432,123 @@ simple_list() {
   print_view
 }
 
+warp_available() {
+  command -v warp-cli >/dev/null 2>&1 && return 0
+  [ -r /etc/warppool-node/warp/wgcf-profile.conf ] && return 0
+  [ -r /usr/local/lib/warppool/bin/wgcf ] && return 0
+  return 1
+}
+
+# Downloads a sibling asset from the release URL and runs it, so a node that was
+# installed dependency-only can still get WARP without re-running the installer.
+fetch_and_run_asset() {
+  local name="$1"
+  shift
+  local dir target
+  dir="$(script_dir)"
+  target="$dir/$name"
+  if [ -r "$target" ]; then
+    bash "$target" "$@"
+    return $?
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    fail "需要 curl 才能下载 $name"
+  fi
+  target="/tmp/warppool-$name"
+  log "正在从 $BASE_URL 下载 $name"
+  curl -fsSL "$BASE_URL/$name" -o "$target" || fail "下载 $name 失败"
+  chmod 0755 "$target"
+  bash "$target" "$@"
+}
+
+cmd_init() {
+  local dev port addr mode eg
+  info ""
+  info "初始化一个独立的出口节点：不依赖任何主服务器。"
+  info "会新建一份 WireGuard 服务端配置、启动接口、并装上开机自愈。"
+  info ""
+
+  if [ -n "$(all_devices)" ]; then
+    info "警告：已经存在 WireGuard 配置："
+    all_devices | sed 's/^/  - /'
+    info ""
+    info "继续会新增一份独立配置，已有的不会被修改。"
+    info ""
+  fi
+
+  ask dev "设备名（≤15 字符，字母数字和 - _ .）" "wpnat"
+  [ -n "$dev" ] || fail "设备名不能为空"
+  case "$dev" in
+    *[!a-zA-Z0-9_.-]*) fail "设备名只能包含字母、数字、- _ ." ;;
+  esac
+  if [ "${#dev}" -gt 15 ]; then
+    fail "设备名不能超过 15 字符（wg-quick 的限制）"
+  fi
+
+  ask port "本机监听端口" "51820"
+  case "$port" in
+    ""|*[!0-9]*) fail "端口必须是数字: $port" ;;
+  esac
+
+  ask addr "隧道网段（服务端地址/掩码）" "10.200.0.1/24"
+
+  eg="$(ip route show default 0.0.0.0/0 2>/dev/null |
+    awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
+  ask eg "出口网卡" "$eg"
+
+  info ""
+  while true; do
+    ask mode "出口模式  1=direct 本机出口   2=warp WARP出口   3=dual 两者都要" "1"
+    case "$mode" in
+      1|direct) mode="direct"; break ;;
+      2|warp) mode="warp"; break ;;
+      3|dual) mode="dual"; break ;;
+      *) log "请输入 1、2 或 3" ;;
+    esac
+  done
+
+  if [ "$mode" != "direct" ] && ! warp_available; then
+    info ""
+    info "本节点还没有可用的 WARP 运行时（warp-cli / wgcf 都没有）。"
+    info "选 warp/dual 时需要它，否则添加 WARP 客户端时会失败。"
+    info ""
+    if confirm "现在安装 WARP"; then
+      if command -v apk >/dev/null 2>&1; then
+        fetch_and_run_asset warp_wgcf.sh "policy=auto"
+      else
+        fetch_and_run_asset warp_install.sh
+      fi
+      if ! warp_available; then
+        log "警告：安装后仍未检测到 WARP 运行时，warp/dual 客户端可能不可用"
+      fi
+    else
+      info "已跳过。之后可手动执行：bash <assets>/warp_install.sh"
+    fi
+  fi
+
+  info ""
+  info "即将执行："
+  info "  设备名     : $dev"
+  info "  监听端口   : $port"
+  info "  隧道网段   : $addr"
+  info "  出口网卡   : $eg"
+  info "  出口模式   : $mode（仅影响上面的 WARP 检查，配置本身不含模式）"
+  info ""
+  info "注意：这会生成一套全新的服务端密钥。"
+  info ""
+  confirm "确认初始化" || { info "已取消，未做任何改动。"; return 0; }
+
+  run_helper action=init "device=$dev" "listen_port=$port" \
+    "server_addr=$addr" "egress=$eg"
+
+  info ""
+  info "下一步：添加客户端"
+  info "  wpls list wgadd"
+  if [ "$mode" != "direct" ]; then
+    info "  （WARP 模式选 2，dual 选 3）"
+  fi
+}
+
 cmd_add() {
   local dev name pub ip mode
   dev="$(detect_device)"
@@ -774,6 +903,7 @@ dispatch() {
   case "$sub" in
     ""|help|-h|--help) usage ;;
     version|--version) printf 'wpls %s\n' "$WPLS_VERSION" ;;
+    init) shift; cmd_init "$@" ;;
     list)
       shift
       case "${1:-}" in

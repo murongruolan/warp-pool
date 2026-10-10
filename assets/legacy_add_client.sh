@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r16"
+SCRIPT_VERSION="2026.10.10-r17"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -89,6 +89,15 @@ Usage:
   bash legacy_add_client.sh action=rotate device=wp2-1 name=<label> \
       client_public_key=<new-key> [warp_client_public_key=<new-key>] [--dry-run]
 
+  bash legacy_add_client.sh action=init device=wpnat \
+      [listen_port=51820] [server_addr=10.200.0.1/24] [egress=eth0] [--dry-run]
+
+action=init builds a brand new WireGuard server config on a node that has none,
+so the node can be used without any main server. It generates the server keypair,
+writes /etc/wireguard/<device>.conf with forwarding hooks, starts and enables the
+interface, and installs a systemd drop-in that retries a failed boot start. The
+config starts empty; add peers with action=add afterwards.
+
 action=rotate swaps a managed client's peer key in place. The tunnel address,
 the NAT rules and every other peer stay exactly as they are; only the
 PublicKey line changes.
@@ -151,8 +160,8 @@ validate_bool() {
 
 validate_args() {
   case "$ACTION" in
-    add|list|remove|rotate) ;;
-    *) fail "unsupported action: $ACTION, expected add, list, remove, or rotate" ;;
+    add|list|remove|rotate|init) ;;
+    *) fail "unsupported action: $ACTION, expected add, list, remove, rotate, or init" ;;
   esac
   case "$MODE" in
     direct|warp|dual) ;;
@@ -1255,6 +1264,143 @@ EOF
   printf '  The tunnel drops for a few seconds until the client reconnects with the new key.\n'
 }
 
+# Creates a brand new WireGuard server config on a node that has none, so the
+# node can be used without any main server. The resulting config has no peers;
+# add them afterwards with action=add (or `wpls list wgadd`).
+init_server() {
+  [ -n "$DEVICE" ] || fail "device=<wg-device> is required"
+
+  if [ -e "$CONF" ]; then
+    fail "$CONF already exists; refusing to overwrite it.
+Remove it first if you really want to rebuild this node from scratch, but note
+that this changes the server key and invalidates every existing client config."
+  fi
+
+  local legacy
+  for legacy in /etc/wireguard/*.conf; do
+    [ -e "$legacy" ] || continue
+    log "warning: another WireGuard config already exists: $legacy"
+    log "warning: this node already looks deployed; 'wpls list' will operate on both"
+  done
+
+  require_command wg
+  require_command wg-quick
+  mkdir -p /etc/wireguard
+  chmod 0700 /etc/wireguard
+
+  if [ -z "$LISTEN_PORT" ]; then
+    LISTEN_PORT="51820"
+  fi
+  case "$LISTEN_PORT" in
+    ""|*[!0-9]*) fail "invalid listen_port: $LISTEN_PORT" ;;
+  esac
+  if [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+    fail "listen_port must be between 1 and 65535: $LISTEN_PORT"
+  fi
+  [ -n "$SERVER_ADDR" ] || SERVER_ADDR="10.200.0.1/24"
+
+  if [ -z "$EGRESS" ]; then
+    EGRESS="$(ip route show default 0.0.0.0/0 2>/dev/null |
+      awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  fi
+  [ -n "$EGRESS" ] || fail "cannot detect the egress interface; pass egress=<iface>"
+
+  SERVER_PRIVATE_KEY="$(wg genkey)"
+  SERVER_PUBLIC_KEY="$(printf '%s' "$SERVER_PRIVATE_KEY" | wg pubkey)"
+  [ -n "$SERVER_PUBLIC_KEY" ] || fail "failed to derive the server public key"
+
+  local tmp
+  tmp="$(temp_conf_path i)"
+  {
+    printf '[Interface]\n'
+    printf 'PrivateKey = %s\n' "$SERVER_PRIVATE_KEY"
+    printf 'Address = %s\n' "$SERVER_ADDR"
+    printf 'ListenPort = %s\n' "$LISTEN_PORT"
+    printf 'SaveConfig = false\n'
+    render_hooks ""
+  } >"$tmp.raw"
+  cat -s "$tmp.raw" >"$tmp"
+  rm -f "$tmp.raw"
+  chmod 0600 "$tmp"
+
+  log "new server config rendered: $tmp"
+  printf '\n'
+  sed 's/^PrivateKey.*/PrivateKey = <REDACTED>/' "$tmp"
+  printf '\n'
+
+  local stripped
+  if ! stripped="$(wg-quick strip "$tmp" 2>/dev/null)"; then
+    fail "rendered config failed wg-quick validation; nothing was changed"
+  fi
+  if printf '%s\n' "$stripped" |
+    grep -qE '^[[:space:]]*(SaveConfig|PostUp|PostDown|PreUp|PreDown|DNS|MTU|Table)[[:space:]]*='; then
+    fail "rendered config leaks wg-quick-only directives; nothing was changed"
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: stopping before install and interface start"
+    return 0
+  fi
+
+  install -m 0600 "$tmp" "$CONF"
+  log "installed: $CONF"
+
+  if ip link show "$DEVICE" >/dev/null 2>&1; then
+    log "interface $DEVICE already exists; syncing"
+    wg syncconf "$DEVICE" <(wg-quick strip "$CONF")
+  else
+    log "starting interface: $DEVICE"
+    wg-quick up "$DEVICE"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable "wg-quick@$DEVICE" >/dev/null 2>&1 || true
+    install_resilient_dropin "$DEVICE"
+  fi
+
+  printf '\n'
+  printf '===== exit node initialized =====\n'
+  printf '  device       : %s\n' "$DEVICE"
+  printf '  server addr  : %s\n' "$SERVER_ADDR"
+  printf '  listen port  : %s\n' "$LISTEN_PORT"
+  printf '  egress iface : %s\n' "$EGRESS"
+  printf '  server pubkey: %s\n' "$SERVER_PUBLIC_KEY"
+  printf '  config       : %s\n' "$CONF"
+  printf '\n'
+  printf '  next: add a client with\n'
+  printf '    wpls list wgadd          (interactive)\n'
+  printf '    or: bash %s action=add device=%s mode=direct name=pc \\\n' "$0" "$DEVICE"
+  printf '        client_public_key=<key> endpoint=<public-ip:port>\n'
+}
+
+# A wg-quick@ unit that fails once at boot (module not loaded yet, iptables not
+# ready) never retries, which is how a whole exit node went dark after a reboot.
+# This drop-in makes it retry until it succeeds.
+install_resilient_dropin() {
+  local dev="$1" dir="${2:-}"
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [ -n "$dir" ] || dir="/etc/systemd/system/wg-quick@$dev.service.d"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "dry-run: install resilient drop-in in $dir"
+    return 0
+  fi
+  mkdir -p "$dir"
+  cat >"$dir/warppool-resilient.conf" <<'EOF'
+[Unit]
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=20
+ExecStartPre=-/sbin/modprobe wireguard
+EOF
+  chmod 0644 "$dir/warppool-resilient.conf"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log "installed resilient drop-in: $dir/warppool-resilient.conf"
+}
+
 main() {
   parse_args "$@"
   require_root
@@ -1274,6 +1420,9 @@ main() {
       if [ "$was_interactive" = "true" ]; then
         print_next_steps
       fi
+      ;;
+    init)
+      init_server
       ;;
     list)
       list_clients
