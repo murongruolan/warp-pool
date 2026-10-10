@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r8"
+SCRIPT_VERSION="2026.10.10-r9"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -210,6 +210,13 @@ state_paths() {
   CONF="/etc/wireguard/$DEVICE.conf"
   CLIENT_STATE_DIR="$STATE_DIR/$DEVICE"
   NAT_V4_FILE="$CLIENT_STATE_DIR/$DEVICE.nat"
+}
+
+# wg-quick refuses a config whose filename is not a valid interface name
+# (<= 15 chars, [A-Za-z0-9_=+.-]), so temp files must not embed the device name
+# and a full PID. These stay well under the limit.
+temp_conf_path() {
+  printf '/tmp/wg.%s.%s.conf\n' "$1" "$$"
 }
 
 download_script() {
@@ -436,7 +443,7 @@ add_client() {
     fail "$CONF has Interface keys this helper will not rebuild: $(printf '%s' "$bad_keys" | tr '\n' ' ')"
   fi
 
-  tmp="/tmp/$DEVICE.new.$$.conf"
+  tmp="$(temp_conf_path a)"
   {
     printf '[Interface]\n'
     sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n 1 | sed 's/^/PrivateKey = /'
@@ -649,7 +656,7 @@ remove_client() {
   local ts backup tmp
   ts="$(date +%Y%m%d-%H%M%S)"
   backup="$CONF.bak.$ts"
-  tmp="/tmp/$DEVICE.remove.$$.conf"
+  tmp="$(temp_conf_path d)"
 
   # Drop whole [Peer] paragraphs whose PublicKey matches. Paragraph mode keeps
   # every other line of the file byte-identical.
@@ -1026,7 +1033,7 @@ rotate_client() {
 
   ts="$(date +%Y%m%d-%H%M%S)"
   backup="$CONF.bak.$ts"
-  tmp="/tmp/$DEVICE.rotate.$$.conf"
+  tmp="$(temp_conf_path r)"
 
   awk -v o1="$old_cpub" -v n1="$new_cpub" \
       -v o2="$old_wpub" -v n2="$new_wpub" '
