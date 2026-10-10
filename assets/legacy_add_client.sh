@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2026.10.10-r5"
+SCRIPT_VERSION="2026.10.10-r6"
 
 # Add a non-main-server client to an existing legacy exclusive WarpPool node
 # (/etc/wireguard/wp<name>.conf). Unlike shared_node.sh, which manages its own
@@ -419,8 +419,7 @@ add_client() {
   local iface_keys bad_keys
   iface_keys="$(sed -n '/^[[:space:]]*\[Interface\]/,/^[[:space:]]*\[Peer\]/p' "$CONF" |
     grep -E '=' |
-    grep -oE '^[[:space:]]*[A-Za-z]+[[:space:]]*=' |
-    tr -d '[:space:=' |
+    sed -E 's/^[[:space:]]*([A-Za-z]+)[[:space:]]*=.*/\1/' |
     sort -u)"
   bad_keys="$(printf '%s\n' "$iface_keys" | grep -vE '^(PrivateKey|Address|ListenPort|SaveConfig|PostUp|PostDown)$' || true)"
   if [ -n "$bad_keys" ]; then
